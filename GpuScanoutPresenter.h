@@ -161,6 +161,10 @@ private:
             const char *v4 = getenv("NGPU_SCALE4");
             id<MTLFunction> function4 = v4 && v4[0] == '0' ? nil : [library newFunctionWithName:@"scanout_scale4"];
             if (function4) pipeline4_ = [device_ newComputePipelineStateWithFunction:function4 error:&error];
+            // Its vector-load form (NGPU_SCALE4V=0 keeps scanout_scale4); an older metallib without it keeps scanout_scale4 too.
+            const char *v4v = getenv("NGPU_SCALE4V");
+            id<MTLFunction> function4v = !function4 || (v4v && v4v[0] == '0') ? nil : [library newFunctionWithName:@"scanout_scale4v"];
+            if (function4v) pipeline4v_ = [device_ newComputePipelineStateWithFunction:function4v error:&error];
         }
         if (lw == mapW_ && lh == mapH_ && taps_) return true;
         taps_ = nil; mapW_ = mapH_ = 0; letterboxed_ = false;
@@ -179,6 +183,12 @@ private:
         uint32_t *t = (uint32_t *)taps_.contents;
         fillTaps(t, t + w, (uint32_t)w, lw);
         fillTaps(t + 2 * w, t + 2 * w + h, (uint32_t)h, lh);
+        // scanout_scale4v reads each group's taps from at most two aligned 16-byte words of a source row.
+        span2_ = !(w % 4);
+        for (uint64_t x = 0; span2_ && x < w; x += 4) {
+            const uint32_t lo = (t[x] < t[w + x] ? t[x] : t[w + x]) / 4, hi = (t[x + 3] > t[w + x + 3] ? t[x + 3] : t[w + x + 3]) / 4;
+            if (hi - lo > 1) span2_ = false;
+        }
         mapW_ = lw; mapH_ = lh;
         return true;
     }
@@ -211,7 +221,8 @@ private:
         ScaleParams p = params_;
         p.srcWords = (uint32_t)(frame.stride / 4);
         const bool wide = pipeline4_ && !(p.ow % 4) && !(p.ox % 4) && !(p.dstWords % 4);
-        [compute setComputePipelineState:wide ? pipeline4_ : pipeline_];
+        const bool vector = wide && pipeline4v_ && span2_ && !(p.srcWords % 4);
+        [compute setComputePipelineState:vector ? pipeline4v_ : wide ? pipeline4_ : pipeline_];
         [compute setBuffer:source offset:0 atIndex:0];
         [compute setBuffer:target_ offset:0 atIndex:1];
         [compute setBuffer:taps_ offset:0 atIndex:2];
@@ -238,7 +249,8 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
-    id<MTLComputePipelineState> pipeline_ = nil, pipeline4_ = nil;
+    id<MTLComputePipelineState> pipeline_ = nil, pipeline4_ = nil, pipeline4v_ = nil;
+    bool span2_ = false;
     id<MTLBuffer> taps_ = nil;
     ScaleParams params_ = {};
     uint32_t mapW_ = 0, mapH_ = 0;
