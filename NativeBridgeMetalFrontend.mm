@@ -676,7 +676,7 @@ static void notified(void *context,uint64_t value) {
 // its parent's first level and slice. metal2vulkan scripts/pipeline-census/frames_manifest.py builds the manifest.
 namespace fcap {
 static std::recursive_mutex gLock;
-static long gSkip=0,gCount=0;static std::atomic<long> gMade{0};static bool gArmed=false;
+static long gSkip=0,gCount=0,gEnd=600;static std::atomic<long> gMade{0},gCommitted{0},gWindowCommitted{0};static bool gArmed=false;
 static std::unordered_map<const void *,std::string> gIds;   // resource -> key, for the window
 static NSMutableArray *gKeep;                                 // the window's resources, alive while their ids are
 static std::unordered_map<std::string,uint64_t> gHashes;      // buffer id -> hash of its last recorded bytes
@@ -685,7 +685,9 @@ static unsigned gNext=0;
 static thread_local bool gInternal=false;                     // a command buffer the capture makes itself
 static void arm() {
  const char *n=getenv("NGPU_CAPTURE_FRAMES"),*s=getenv("NGPU_CAPTURE_SKIP");
+ const char *e=getenv("NGPU_CAPTURE_END");
  gCount=n?atol(n):0;gSkip=s?atol(s):0;gArmed=pcap::on() && gCount>0;
+ gEnd=e?atol(e):gArmed?gSkip+gCount:600;
  if(gArmed){gKeep=[NSMutableArray array];journal("X frames "+std::to_string(gCount)+" after "+std::to_string(gSkip));}
 }
 // The command buffer's index in the window, or -1.
@@ -696,6 +698,7 @@ static long begin() {
 }
 static void record(const std::string &line) {
  std::lock_guard<std::recursive_mutex> guard(gLock);
+ if(pcap::stopped())return;
  if(FILE *f=fopen((pcap::dir()+"/frames.jsonl").c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
 static uint64_t hash(const void *bytes,size_t n) {
@@ -807,12 +810,21 @@ static std::string depthStencil(NBDepthStencil *d) {
  if(fresh)record("{\"depthStencil\":\""+key+"\",\"descriptor\":"+(d.captureText.empty()?std::string("{}"):d.captureText)+"}");
  return key;
 }
+// A buffer's bytes read through the VM (vm_read_overwrite), so a no-copy range its owner unmapped answers false instead of faulting
+// the process (session-085521: backboardd SIGBUS while the capture read buffers whose imports the owner had unmapped).
+static bool copyOut(const void *bytes,size_t n,std::vector<uint8_t> &out) {
+ out.resize(n);vm_size_t got=0;
+ return n && vm_read_overwrite(mach_task_self(),(vm_address_t)bytes,n,(vm_address_t)out.data(),&got)==KERN_SUCCESS && got==n;
+}
 // At commit: the bytes of every buffer the command buffer names that changed since they were last recorded, then its encoders.
 static void commit(FrameCb *cb) {
  std::string uploads;
+ std::vector<uint8_t> copy;
  for(NBBuffer *b in cb->buffers) {
-  void *bytes=b.contents;if(!bytes)continue;
+  const void *mapped=b.contents;if(!mapped)continue;
   const std::string key=named(b,"b",nullptr);const size_t n=b.length;
+  if(!copyOut(mapped,n,copy)){uploads+=(uploads.empty()?"":",")+std::string("{\"buffer\":\"")+key+"\",\"unreadable\":true}";continue;}
+  const void *bytes=copy.data();
   const uint64_t h=hash(bytes,n);
   {std::lock_guard<std::recursive_mutex> guard(gLock);auto at=gHashes.find(key);if(at!=gHashes.end() && at->second==h)continue;gHashes[key]=h;}
   uploads+=(uploads.empty()?"":",")+std::string("{\"buffer\":\"")+key+"\",\"file\":\""+blob(bytes,n)+"\"}";
@@ -820,6 +832,19 @@ static void commit(FrameCb *cb) {
  std::string s="{\"commandBuffer\":"+std::to_string(cb->index)+",\"uploads\":["+uploads+"],\"encoders\":[";
  for(size_t i=0;i<cb->encoders.size();i++)s+=(i?",":"")+cb->encoders[i];
  record(s+"]}");
+ gWindowCommitted++;
+}
+// Each commit while the capture is on: the capture ends with the window's last command buffer (or 64 command buffers after a window
+// one never committed), or at NGPU_CAPTURE_END command buffers.
+static void committed() {
+ if(!pcap::on())return;
+ const long n=++gCommitted;
+ const bool windowDone=gArmed && (gWindowCommitted>=gCount || gMade>gSkip+gCount+64);
+ if((gArmed && windowDone) || n>=gEnd) {
+  std::lock_guard<std::recursive_mutex> guard(gLock);
+  pcap::finish("{\"commandBuffers\":"+std::to_string(n)+",\"frames\":"+std::to_string((long)gWindowCommitted)+",\"resources\":"+std::to_string(gNext)+"}");
+  journal("X capture done after "+std::to_string(n)+" command buffers, "+std::to_string((long)gWindowCommitted)+" captured");
+ }
 }
 static const char *stageName(uint32_t stage) {return stage==1?"vertex":stage==2?"fragment":"kernel";}
 static std::string num(double v) {char e[40];snprintf(e,sizeof e,"%.9g",v);return e;}
@@ -1330,6 +1355,7 @@ static void scheduled(void *context);
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  if(_frame){fcap::commit(_frame.get());_frame=nullptr;}
+ fcap::committed();
  self.committedUs=nowUs();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);

@@ -3,6 +3,7 @@
 // function and pipeline state the process makes, so metal2vulkan's pipeline-census can make the same states on a host
 // (metal2vulkan scripts/pipeline-census/capture_manifest.py turns the capture into its manifest).
 //
+// The capture ends at NGPU_CAPTURE_END command buffers (default: the frame window's end, else 600) and then writes capture.done.
 // NGPU_CAPTURE=1 writes under the runtime's cache directory, NGPU_CAPTURE=/abs/dir under that directory, each in a directory of
 // its own per process, <progname>-<pid>: capture.jsonl (one JSON object per line) and lib-<sha>.metallib, each library's bytes
 // once. Records:
@@ -34,7 +35,14 @@
 namespace pcap {
 inline std::mutex &lock() {static std::mutex m;return m;}
 inline std::string &dir() {static std::string d;return d;}
-inline bool on() {return !dir().empty();}
+inline std::atomic<bool> &stopped() {static std::atomic<bool> s{false};return s;}
+inline bool on() {return !dir().empty() && !stopped();}
+// Ends the capture: no record is written after this, and capture.done (the summary) says the files are complete.
+inline void finish(const std::string &summary) {
+ std::lock_guard<std::mutex> guard(lock());
+ if(dir().empty() || stopped().exchange(true))return;
+ if(FILE *f=fopen((dir()+"/capture.done").c_str(),"w")){fwrite(summary.data(),1,summary.size(),f);fputc('\n',f);fclose(f);}
+}
 // Called once with the runtime's cache directory (may be null).
 inline void begin(const char *cache) {
  const char *v=getenv("NGPU_CAPTURE");
@@ -68,6 +76,7 @@ inline std::string quote(const char *s) {
 }
 inline void record(const std::string &line) {
  std::lock_guard<std::mutex> guard(lock());
+ if(stopped())return;
  if(FILE *f=fopen((dir()+"/capture.jsonl").c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
 // A library's id; its bytes are written once.
