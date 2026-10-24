@@ -221,6 +221,19 @@ static id deviceForPort(unsigned port) {
             fclose(f);
         }
         setenv("TU_DEBUG", tuDebug, 0);
+        // Diagnostics: each KEY=VALUE line of /private/var/ngpu/gpu-env is set for the Metal process before Turnip loads
+        // (e.g. IR3_SHADER_DEBUG=disasm with MESA_SHADER_CACHE_DISABLE=true: every compiled shader's IR3 into the Mesa log).
+        if (FILE *f = fopen("/private/var/ngpu/gpu-env", "r")) {
+            char line[256];
+            while (fgets(line, sizeof line, f)) {
+                line[strcspn(line, "\r\n")] = 0;
+                if (char *eq = strchr(line, '=')) {
+                    *eq = 0;
+                    if (line[0] && line[0] != '#') setenv(line, eq + 1, 1);
+                }
+            }
+            fclose(f);
+        }
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
