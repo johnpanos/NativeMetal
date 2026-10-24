@@ -185,6 +185,12 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // that process can take it; every other process keeps the untrusted-guest policy.
         // NGPU_UNIFORM_OFFSET_SPEC=1 (gpu-env, an A/B, default off; metal2vulkan uniform-offset-low): a uniform view's loads read
         // the bind offset's low four bits from a specialization constant, so Turnip places each load in its vector.
+        // NGPU_IDLE_COLORS=1 (gpu-env, an A/B, default off): a color attachment that loads and stores DontCare stays out of the
+        // draws' subpass until a draw writes or fetches it, so Turnip's GMEM holds no tile memory for CoreAnimation's idle second
+        // color (DevicePolicy::idle_colors).
+        if std::env::var("NGPU_IDLE_COLORS").as_deref() == Ok("1") {
+            options.policy.idle_colors = metal2vulkan::device::IdleColorsPolicy::LeftOut;
+        }
         if std::env::var("NGPU_UNIFORM_OFFSET_SPEC").as_deref() == Ok("1") {
             options.policy.uniform_offset = metal2vulkan::device::UniformOffsetPolicy::Specialized;
         }
