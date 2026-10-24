@@ -592,8 +592,7 @@ static std::string quartzCoreCallers();
  // the App Library's backdrop black (session-163610).
  uint32_t xrMask;
  std::shared_ptr<NmbRenderPipelineDescriptor> xrDescriptor;
- NmbRenderPipeline *xrHandle;
- bool xrTried;
+ std::map<uint32_t,NmbRenderPipeline *> xrHandles;   // by the remapped attachments the pass keeps XR on; null: refused
 }
 @property(nonatomic) NmbRenderPipeline *handle;
 @property(nonatomic) long captureId;   // the pipeline capture's render number, -1 when it is off
@@ -602,21 +601,25 @@ static std::string quartzCoreCallers();
 @end
 static std::atomic<uint64_t> gXrVariants;
 @implementation NBRenderPipeline
-- (void)dealloc {nmb_render_pipeline_release(_handle);if(xrHandle)nmb_render_pipeline_release(xrHandle);}
-// The pipeline for a pass whose XR color attachments are passXr: the caller's formats where the pass keeps XR on an attachment this
-// pipeline remapped, else the RGBA16Float one.
+- (void)dealloc {nmb_render_pipeline_release(_handle);for(auto &[k,h]:xrHandles)if(h)nmb_render_pipeline_release(h);}
+// The pipeline for a pass whose XR color attachments are passXr: each attachment this pipeline remapped takes the caller's XR format
+// where the pass keeps XR on it, RGBA16Float elsewhere (a variant per combination, made at its first use).
 - (NmbRenderPipeline *)handleForXr:(uint32_t)passXr {
- if(!(xrMask & passXr) || !xrDescriptor)return _handle;
+ const uint32_t key=xrMask & passXr;
+ if(!key || !xrDescriptor)return _handle;
  @synchronized(self) {
-  if(!xrTried) {
-   xrTried=true;
+  auto at=xrHandles.find(key);
+  if(at==xrHandles.end()) {
+   NmbRenderPipelineDescriptor variant=*xrDescriptor;
+   for(unsigned i=0;i<8;i++)if((xrMask>>i&1) && !(key>>i&1))variant.colors[i].format=xrFormat(variant.colors[i].format);
    const NmbPipelineOptions creation={0,nullptr,0};
    const uint64_t began=nowUs();
-   xrHandle=nmb_render_pipeline_new_with_options(gDevice,xrDescriptor.get(),&creation);gTimePipeline.add(began);
-   if(xrHandle)gXrVariants++;else noteProblem([NSString stringWithFormat:@"render pipeline (XR variant): %s",nmb_last_error()]);
+   NmbRenderPipeline *h=nmb_render_pipeline_new_with_options(gDevice,&variant,&creation);gTimePipeline.add(began);
+   if(h)gXrVariants++;else noteProblem([NSString stringWithFormat:@"render pipeline (XR variant %x): %s",key,nmb_last_error()]);
+   at=xrHandles.emplace(key,h).first;
   }
+  return at->second?:_handle;
  }
- return xrHandle?:_handle;
 }
 // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
 - (NSUInteger)maxTotalThreadsPerThreadgroup {
