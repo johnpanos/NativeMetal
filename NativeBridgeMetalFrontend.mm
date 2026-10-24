@@ -57,8 +57,11 @@ static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
 static std::mutex gProblemLock;
 static char gLastProblems[2][200];
+static void journal(const std::string &line);
+// Every problem also goes to the pipeline journal as a P line (the render server can die before the status line streams it).
 static void noteProblem(NSString *what) {
  gProblems++;
+ journal(std::string("P ")+(what.UTF8String?:"?"));
  std::lock_guard<std::mutex> lock(gProblemLock);
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
@@ -94,6 +97,7 @@ static void journal(const std::string &line) {
 @implementation NBObject
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (void)doesNotRecognizeSelector:(SEL)selector {
+ journal(std::string("M ")+class_getName(object_getClass(self))+" "+sel_getName(selector));
  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
  noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
  [super doesNotRecognizeSelector:selector];
@@ -1258,6 +1262,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  return MTLSizeMake(s[0],s[1],s[2]);
 }
 - (void)doesNotRecognizeSelector:(SEL)selector {
+ journal(std::string("M ")+class_getName(object_getClass(self))+" "+sel_getName(selector));
  if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
  noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
  [super doesNotRecognizeSelector:selector];
