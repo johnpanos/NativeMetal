@@ -186,7 +186,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // NGPU_UNIFORM_OFFSET_SPEC=1 (gpu-env, an A/B, default off; metal2vulkan uniform-offset-low): a uniform view's loads read
         // the bind offset's low four bits from a specialization constant, so Turnip places each load in its vector.
         if std::env::var("NGPU_UNIFORM_OFFSET_SPEC").as_deref() == Ok("1") {
-            options.policy.uniform_offset = metal2vulkan::device::policy::UniformOffsetPolicy::Specialized;
+            options.policy.uniform_offset = metal2vulkan::device::UniformOffsetPolicy::Specialized;
         }
         if trusted_process() && std::env::var("NGPU_TRUSTED_RENDER_SERVER").as_deref() == Ok("1") {
             options.policy.containment = metal2vulkan::device::ContainmentPolicy::UnsafeOff;
