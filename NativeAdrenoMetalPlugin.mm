@@ -17,6 +17,7 @@
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
+#include "PrimeShaders.h"
 #include "ExceptionDiag.h"
 #include "TargetBuild.h"
 
@@ -205,6 +206,12 @@ static id deviceForPort(unsigned port) {
         if (tried) return device;
         tried = true;
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
+        // Every Metal process renders in system memory: Turnip's GMEM passes hand work between the BV and BR threads, and with IFPC off
+        // and a context reset on every client switch the two still stopped waiting on each other inside a pass (int-261p, int-262: GPU idle,
+        // BR one IB ahead, BV inside a draw IB2). int-257's nobin covered the render server only. System memory alone still let BV run
+        // ahead of BR across passes (concurrent binning is emitted for sysmem passes too) and it hung the same way in int-265: no
+        // concurrent binning either.
+        setenv("TU_DEBUG", "sysmem,nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -364,6 +371,17 @@ static id deviceForPort(unsigned port) {
             cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
             return nullptr;
         }, gpu);
+        // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
+        // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
+        // The translator recurses deeply on large functions: give it the stack of a main thread.
+        pthread_attr_setstacksize(&attributes, 8u << 20);
+        pthread_t primer;
+        pthread_create(&primer, &attributes, [](void *) -> void * {
+            char list[1024];
+            prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
+                       requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
+            return nullptr;
+        }, nullptr);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
         return device;

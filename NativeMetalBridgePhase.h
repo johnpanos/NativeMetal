@@ -92,6 +92,8 @@ struct ScanoutContext {
     Gpu *marker;
 };
 static void serveScanout(Gpu &gpu, id device) {
+    // This thread carries every frame to the screen; at the default priority it waited behind the launching apps' threads.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     ScanoutContext context;
     context.marker = &gpu;
     Gpu &link = context.link;

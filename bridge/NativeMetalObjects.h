@@ -64,6 +64,10 @@ bool nmb_binary_archive_serialize(NmbBinaryArchive *, const char *path);
 NmbBuffer *nmb_buffer_new(NmbDevice *, uint64_t length, uint64_t options, const void *bytes /* NULL: zeroed */);
 /* Wraps page-aligned memory the caller keeps mapped until the buffer is released (an IOSurface's base, host pages). */
 NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, uint64_t options);
+/* The same with Metal's deallocator: release(context, pointer, length) runs once, on any thread, when the pages' import is freed (the last
+ * buffer and every command buffer using them are gone). A refused call (NULL) never runs it. */
+NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
+                                            void (*release)(void *context, void *pointer, uint64_t length), void *context);
 void nmb_buffer_release(NmbBuffer *);
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
@@ -85,6 +89,10 @@ NmbTexture *nmb_heap_new_texture(const NmbHeap *, const struct NmbTextureDescrip
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
+// A texture over a surface with planes; a two-plane surface gives its OSType, the asked plane, its size and plane 1's offset and rows.
+NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
+                                       uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height, uint64_t chroma_offset,
+                                       uint64_t chroma_bytes_per_row);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
