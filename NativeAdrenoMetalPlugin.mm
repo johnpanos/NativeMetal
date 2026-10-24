@@ -212,7 +212,15 @@ static id deviceForPort(unsigned port) {
         // BR one IB ahead, BV inside a draw IB2). int-257's nobin covered the render server only. System memory alone still let BV run
         // ahead of BR across passes (concurrent binning is emitted for sysmem passes too) and it hung the same way in int-265: no
         // concurrent binning either.
-        setenv("TU_DEBUG", "sysmem,nocb", 0);
+        // A board may override the choice for its GPU (fajita's A630 has no BV/BR concurrent binning): the first line of
+        // /private/var/ngpu/tu-debug replaces it (an empty line: Turnip's default, GMEM passes where it picks them).
+        static char tuDebug[96] = "sysmem,nocb";
+        if (FILE *f = fopen("/private/var/ngpu/tu-debug", "r")) {
+            if (!fgets(tuDebug, sizeof tuDebug, f)) tuDebug[0] = 0;
+            tuDebug[strcspn(tuDebug, "\r\n")] = 0;
+            fclose(f);
+        }
+        setenv("TU_DEBUG", tuDebug, 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
