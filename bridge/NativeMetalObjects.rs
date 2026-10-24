@@ -1542,6 +1542,16 @@ pub extern "C" fn nmb_command_buffer_gpu_time(command_buffer: *const NmbCommandB
     })
 }
 
+/// `kernelStartTime` / `kernelEndTime`: when the translator's scheduler began and finished submitting the command buffer to Vulkan
+/// (seconds of the host clock; 0 before). For the frontend's frame trace.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_kernel_time(command_buffer: *const NmbCommandBuffer, end: bool) -> f64 {
+    guard(0.0, || {
+        let command_buffer = &get(command_buffer)?.0;
+        Ok(if end { command_buffer.kernel_end_time() } else { command_buffer.kernel_start_time() })
+    })
+}
+
 // ---- events and fences ----
 
 pub enum NmbEvent {

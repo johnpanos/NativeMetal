@@ -12,6 +12,12 @@
 #include "GpuScanoutPresenter.h"
 #include "../NativeMobileDisplay/NativeGOPWire.h"
 
+// The native frontend's frame trace (FrameTrace.h): one S line per swap. A no-op elsewhere; the frontend's definition replaces this one.
+extern "C" __attribute__((weak)) void NBTraceSwap(uint64_t sequence, uint64_t waitUs, uint64_t offerUs, uint64_t presentedUs, uint64_t completedUs,
+                                                  uint32_t width, uint32_t height, uint32_t mapId, int result) {
+    (void)sequence; (void)waitUs; (void)offerUs; (void)presentedUs; (void)completedUs; (void)width; (void)height; (void)mapId; (void)result;
+}
+
 namespace gpuscanout {
 
 struct Transport {
@@ -71,6 +77,7 @@ public:
     bool serveOne(uint64_t timeoutMs) {
         NGPWait wait = {timeoutMs};
         NGPSwap swap = {};
+        const uint64_t waitBegan = mach_absolute_time();
         if (!stats_->timeouts && !stats_->frames) note(0x6720);   // first wait
         const int status = transport_.call(transport_.context, NGP_METHOD_WAIT_SWAP, &wait, sizeof wait, &swap, sizeof swap);
         if (status) {
@@ -95,8 +102,16 @@ public:
         stats_->importsKept = presenter_->importsKept();
         if (r == gpupresent::kOk && !swap.reserved && stats_->verified < 4 && swap.width == scanout_.width && swap.height == scanout_.height) verify(swap);
         note(0x6731);   // the GPU copy returned
+        const uint64_t presented = mach_absolute_time();
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
+        {
+            static mach_timebase_info_data_t base;
+            if (!base.denom) mach_timebase_info(&base);
+            auto us = [&](uint64_t t) {return t * base.numer / base.denom / 1000;};
+            NBTraceSwap(swap.sequence, us(waitBegan), us(began), us(presented), us(mach_absolute_time()), swap.width, swap.height, swap.reserved,
+                        completed ? -1 : (int)r);
+        }
         if (completed) {++stats_->failures; stats_->error = completed; return false;}
         if (r == gpupresent::kOk) ++stats_->frames; else ++stats_->failures;
         return true;

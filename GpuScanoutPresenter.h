@@ -42,6 +42,7 @@ class Presenter {
 public:
     Presenter(id<MTLDevice> device, const Scanout &scanout) : device_(device), scanout_(scanout) {
         queue_ = [device newCommandQueue];
+        queue_.label = @"ngpu.present";
         if (!validScanout() || !queue_) return;
         target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
     }

@@ -26,6 +26,7 @@
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
 #include "PipelineCapture.h"
+#include "FrameTrace.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -44,9 +45,12 @@ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBigg
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
-struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
- void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
-static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
+// traceKind >= 0: each one is also a frame-trace P line (FrameTrace.h).
+struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};int traceKind;
+ explicit Timed(int kind=-1):traceKind(kind){}
+ void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}
+  if(ftrace::on() && traceKind>=0)ftrace::linef("P,%llu,%llu,%d",(unsigned long long)began,(unsigned long long)took,traceKind);}};
+static Timed gTimePipeline(0),gTimeLibrary(2),gTimeFunction(3),gTimeEncodeToCommit;
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
 static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
@@ -653,12 +657,16 @@ static void notified(void *context,uint64_t value) {
 // ---- command buffers and encoders ----
 @interface NBQueue : NBObject
 @property(nonatomic) NmbQueue *handle;
+@property(nonatomic) uint32_t traceSerial;   // the frame trace's queue number
 @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
 @end
 @interface NBCommandBuffer : NBObject {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
+ // The frame trace (FrameTrace.h), when it is on: the commit's return, and the frontend's totals when the command buffer was made.
+ uint64_t traceCommittedUs,tracePipeUs,tracePipeN,traceWaitUs,traceFlushUs,traceFlushBytes,traceDoneUs,traceHandledUs;
+ std::atomic<int> traceJoin;   // the commit's return and the completion: the second writes the C line
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -1194,10 +1202,17 @@ static void noteSurfaceContents(NBTexture *texture) {
 
 static void completed(void *context);
 static void scheduled(void *context);
+// The frame trace's view of the frontend's totals (FrameTrace.h): pipeline/library/function creation, waits for GPU work, CPU cache
+// maintenance and host copies of imports and surfaces.
+static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64_t &flushUs,uint64_t &flushBytes) {
+ pipeUs=gTimePipeline.total+gTimeLibrary.total+gTimeFunction.total;pipeN=gTimePipeline.count+gTimeLibrary.count+gTimeFunction.count;
+ waitUs=gTimeResourceWait.total+gTimeWaitCompleted.total+gTimeWaitScheduled.total;
+ flushUs=gTimeImportFlush.total+gTimeSurfaceFlush.total;flushBytes=gImportFlushBytes+gSurfaceFlushBytes+gHostCopyBytes;
+}
 @implementation NBCommandBuffer
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self)createdUs=nowUs();
+ if(self){createdUs=nowUs();if(ftrace::on())traceTotals(tracePipeUs,tracePipeN,traceWaitUs,traceFlushUs,traceFlushBytes);}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -1394,8 +1409,12 @@ static void scheduled(void *context);
   flushSurfaces(_surfaces);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
+  if(ftrace::on())[self traceTotalsAtCommit];
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
+     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
+   if(ftrace::on())[self traceCommitted];
+   return;
+  }
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
@@ -1408,6 +1427,27 @@ static void scheduled(void *context);
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
  gTimeWaitCompleted.add(began);
+ if(ftrace::on())ftrace::linef("W,%llu,%llu,0,%u",(unsigned long long)began,(unsigned long long)(nowUs()-began),self.commitIndex);
+}
+// The frame trace: the totals' growth while the command buffer was encoded and its imports flushed replaces their snapshot.
+- (void)traceTotalsAtCommit {
+ uint64_t pipeUs,pipeN,waitUs,flushUs,flushBytes;traceTotals(pipeUs,pipeN,waitUs,flushUs,flushBytes);
+ tracePipeUs=pipeUs-tracePipeUs;tracePipeN=pipeN-tracePipeN;traceWaitUs=waitUs-traceWaitUs;traceFlushUs=flushUs-traceFlushUs;traceFlushBytes=flushBytes-traceFlushBytes;
+}
+- (void)traceCommitted {traceCommittedUs=nowUs();if(++traceJoin==2)[self traceLine];}
+- (void)traceCompleted:(uint64_t)doneUs {traceDoneUs=doneUs;traceHandledUs=nowUs();if(++traceJoin==2)[self traceLine];}
+// The frame trace's C line (FrameTrace.h).
+- (void)traceLine {
+ const uint64_t doneUs=traceDoneUs,handled=traceHandledUs;
+ const double ks=nmb_command_buffer_kernel_time(_handle,false),ke=nmb_command_buffer_kernel_time(_handle,true);
+ const double gs=nmb_command_buffer_gpu_time(_handle,false),ge=nmb_command_buffer_gpu_time(_handle,true);
+ auto us=[](double seconds)->unsigned long long {return seconds>0?(unsigned long long)(seconds*1e6+0.5):0;};
+ const EncodedWork &w=encodedWork;
+ ftrace::linef("C,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%s",self.commitIndex,_queue.traceSerial,
+  (unsigned long long)createdUs,(unsigned long long)self.committedUs,(unsigned long long)traceCommittedUs,us(ks),us(ke),us(gs),us(ge),
+  (unsigned long long)doneUs,(unsigned long long)handled,w.passes,w.draws,w.dispatches,w.blits,(unsigned long long)w.pixels,
+  (unsigned long long)tracePipeUs,(unsigned long long)tracePipeN,(unsigned long long)traceWaitUs,(unsigned long long)traceFlushUs,
+  (unsigned long long)(traceFlushBytes>>10),ftrace::field((self.label?:_queue.label).UTF8String).c_str());
 }
 - (void)waitUntilScheduled {
  if(!self.committed)return;
@@ -1417,6 +1457,7 @@ static void scheduled(void *context);
  }
  dispatch_group_wait(_schedulingHandlers,DISPATCH_TIME_FOREVER);
  gTimeWaitScheduled.add(began);
+ if(ftrace::on())ftrace::linef("W,%llu,%llu,1,%u",(unsigned long long)began,(unsigned long long)(nowUs()-began),self.commitIndex);
 }
 @end
 static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
@@ -1432,7 +1473,9 @@ static void completed(void *context) {
   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
   if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
  }
+ const uint64_t doneUs=ftrace::on()?nowUs():0;
  [commandBuffer finish];
+ if(doneUs)[commandBuffer traceCompleted:doneUs];
 }
 
 @implementation NBQueue
@@ -1756,7 +1799,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLCommandQueue>)newCommandQueue {
  NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
- NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
+ NBQueue *queue=[NBQueue new];queue.handle=handle;
+ static std::atomic<uint32_t> queues{0};queue.traceSerial=++queues;
+ return (id<MTLCommandQueue>)queue;
 }
 - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d {
  if(!d)return nil;
@@ -2035,6 +2080,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  pcap::begin(cache);if(pcap::on())journal("X capture "+pcap::dir());
+ ftrace::begin(cache);if(ftrace::on())journal("X frametrace "+ftrace::path());
  fcap::arm();
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
@@ -2245,4 +2291,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
 extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
  std::lock_guard<std::mutex> lock(gProblemLock);
  return native_bridge_metal_formats_locked(out,size);
+}
+
+// The scanout client's swaps for the frame trace (GpuScanoutClient.h declares it weak).
+extern "C" void NBTraceSwap(uint64_t sequence,uint64_t waitUs,uint64_t offerUs,uint64_t presentedUs,uint64_t completedUs,uint32_t width,uint32_t height,
+                            uint32_t mapId,int result) {
+ if(!ftrace::on())return;
+ ftrace::linef("S,%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%d",(unsigned long long)sequence,(unsigned long long)waitUs,(unsigned long long)offerUs,
+               (unsigned long long)presentedUs,(unsigned long long)completedUs,width,height,mapId,result);
 }

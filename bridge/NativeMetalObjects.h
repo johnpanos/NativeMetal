@@ -195,6 +195,7 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
 uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
 size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
+double nmb_command_buffer_kernel_time(const NmbCommandBuffer *, bool end);
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
 NmbEvent *nmb_event_new(NmbDevice *, bool shared);
