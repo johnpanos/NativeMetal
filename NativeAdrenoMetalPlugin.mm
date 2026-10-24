@@ -18,6 +18,7 @@
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "ExceptionDiag.h"
+#include "TargetBuild.h"
 
 @interface _MTLDevice : NSObject
 @end
@@ -108,6 +109,8 @@ static void markSample(Gpu &gpu, const DisplaySample &x, unsigned base) {
     gpu.mark((base + 0x2000) | (x.mode << 4) | x.behaviour);     // mode colour field, ICC/other behaviour bytes
 }
 static void reportDisplayState(Gpu &gpu) {
+    // Fixed 21H461 QuartzCore addresses (read and one write): on any other image they name unrelated memory.
+    if (!targetbuild::is21H461()) return;
     ++gReports;
     static DisplaySample before;
     static bool changed;

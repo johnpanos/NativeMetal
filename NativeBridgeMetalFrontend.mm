@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
+#include "TargetBuild.h"
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -1006,6 +1007,8 @@ static std::string quartzCoreCallers() {
  // can cause, and the debug byte was 0). MetalContext::create_pipeline_state (header +0x143000) saves its caller's x19 at fp-8, and its
  // caller MetalContext::draw keeps `this` in x19: the frame record whose return address is +0x143214 links to that frame. Read with
  // vm_read so a different stack layout reports ctx=? instead of faulting.
+ // The context and debug-option reads below use 21H461 QuartzCore offsets; another image reports only the return addresses.
+ if(header && !targetbuild::is21H461()) {out+=" ctx=- dbg=-";header=0;}
  if(header) {
   uintptr_t fp=(uintptr_t)__builtin_frame_address(0),ctx=0;
   for(unsigned depth=0;fp && depth<24;++depth) {
@@ -1481,8 +1484,8 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(getenv("NMB_DEVICE_BASE_NSOBJECT"))base=[NSObject class];
 #endif
 #if TARGET_OS_IPHONE
- // The target's base class ABI (iPadOS 17.7.11): the dynamic subclass adds no instance variables.
- if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
+ // The target's base class ABI (536 bytes on iPadOS 17.7.11, 528 on iOS 16.7.16): the dynamic subclass adds no instance variables.
+ if(!base || class_getInstanceSize(base)!=targetbuild::mtlDeviceBytes()){NBLOG(@"native-metal: unexpected _MTLDevice ABI (%zu bytes)",base?class_getInstanceSize(base):0);return nil;}
 #endif
  if(!base)base=[NSObject class];
  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;
