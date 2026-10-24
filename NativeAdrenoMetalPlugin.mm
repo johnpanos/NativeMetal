@@ -314,7 +314,9 @@ static id deviceForPort(unsigned port) {
         for (unsigned i : order) {
             if (device) break;
             if (!candidates[i][0]) continue;
-            strlcat(candidates[i], "m2v", sizeof candidates[i]);
+            // NGPU_M2V_DIR (gpu-env): another directory name, e.g. a fresh one so every pipeline compiles again (shader dumps).
+            const char *m2v = getenv("NGPU_M2V_DIR");
+            strlcat(candidates[i], m2v && m2v[0] && !strchr(m2v, '/') ? m2v : "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
