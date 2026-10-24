@@ -677,8 +677,9 @@ static void notified(void *context,uint64_t value) {
 namespace fcap {
 static std::recursive_mutex gLock;
 static long gSkip=0,gCount=0,gEnd=600;static std::atomic<long> gMade{0},gCommitted{0},gWindowCommitted{0};static bool gArmed=false;
-static std::unordered_map<const void *,std::string> gIds;   // resource -> key, for the window
-static NSMutableArray *gKeep;                                 // the window's resources, alive while their ids are
+// A resource's id is an associated object of the resource itself: the capture never extends a resource's life (session-085521 and
+// -093006: backboardd SIGBUS while the window held CA's no-copy buffers past their owners' release, the owners' pages unmapped).
+static char gIdKey;
 static std::unordered_map<std::string,uint64_t> gHashes;      // buffer id -> hash of its last recorded bytes
 static std::set<uint64_t> gBlobs;
 static unsigned gNext=0;
@@ -688,7 +689,7 @@ static void arm() {
  const char *e=getenv("NGPU_CAPTURE_END");
  gCount=n?atol(n):0;gSkip=s?atol(s):0;gArmed=pcap::on() && gCount>0;
  gEnd=e?atol(e):gArmed?0:600;   // a window ends the capture itself; NGPU_CAPTURE_END set ends it there in any case
- if(gArmed){gKeep=[NSMutableArray array];journal("X frames "+std::to_string(gCount)+" after "+std::to_string(gSkip));}
+ if(gArmed){journal("X frames "+std::to_string(gCount)+" after "+std::to_string(gSkip));}
 }
 // The command buffer's index in the window, or -1.
 static long begin() {
@@ -716,9 +717,9 @@ static std::string blob(const void *bytes,size_t n) {
 }
 static std::string named(id object,const char *prefix,bool *fresh) {
  std::lock_guard<std::recursive_mutex> guard(gLock);
- auto at=gIds.find((__bridge const void *)object);
- if(at!=gIds.end()){if(fresh)*fresh=false;return at->second;}
- const std::string key=prefix+std::to_string(gNext++);gIds[(__bridge const void *)object]=key;[gKeep addObject:object];
+ if(NSString *known=objc_getAssociatedObject(object,&gIdKey)){if(fresh)*fresh=false;return known.UTF8String;}
+ const std::string key=prefix+std::to_string(gNext++);
+ objc_setAssociatedObject(object,&gIdKey,[NSString stringWithUTF8String:key.c_str()],OBJC_ASSOCIATION_RETAIN_NONATOMIC);
  if(fresh)*fresh=true;
  return key;
 }
@@ -751,11 +752,9 @@ static std::string contents(NBTexture *t) {
  const uint64_t row=texel*d.width,image=row*d.height,slices=std::max<uint64_t>(d.array_length,1)*(d.type==5?6:1);
  std::vector<uint8_t> bytes(image*slices);
  waitForResource(t);
- const uint64_t region[6]={0,0,0,d.width,d.height,1};
- bool ok=true;
- for(uint64_t s=0;s<slices && ok;s++)ok=nmb_texture_get_bytes(t.handle,bytes.data()+s*image,row,image,image,region,0,s);
- if(!ok) {
-  // A private texture: copied through a blit on a queue of the capture's own, which is not captured.
+ {
+  // Copied through a blit on a queue of the capture's own (not captured), never read by the CPU: getBytes on a texture over a host
+  // range its owner had unmapped faulted the render server (session-093006: SIGBUS in Texture::get_bytes under this function).
   static id<MTLCommandQueue> queue;static std::once_flag once;
   std::call_once(once,[]{queue=[(id<MTLDevice>)gDeviceObject newCommandQueue];});
   gInternal=true;
