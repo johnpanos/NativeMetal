@@ -23,3 +23,19 @@ kernel void scanout_scale(device const uint *src [[buffer(0)]], device uint *dst
     const uint v = avg2(avg2(src[r0 + c0], src[r0 + c1]), avg2(src[r1 + c0], src[r1 + c1]));
     dst[(p.oy + g.y) * p.dstWords + p.ox + g.x] = v;
 }
+
+// Four image columns per thread, written with one 16-byte store: the scanout is device memory to the GPU, where every store is its own
+// transaction, so the scalar kernel's 4-byte stores cost four times the transactions. Same taps and rounding as scanout_scale. Used when
+// the rectangle's origin, width and the scanout stride are multiples of four pixels (GpuScanoutPresenter.h); grid x is ow / 4.
+kernel void scanout_scale4(device const uint *src [[buffer(0)]], device uint4 *dst [[buffer(1)]], device const uint *taps [[buffer(2)]],
+                           constant ScaleParams &p [[buffer(3)]], uint2 g [[thread_position_in_grid]]) {
+    const uint x0 = g.x * 4;
+    if (x0 >= p.ow || g.y >= p.oh) return;
+    const uint r0 = taps[2 * p.ow + g.y] * p.srcWords, r1 = taps[2 * p.ow + p.oh + g.y] * p.srcWords;
+    uint4 v;
+    for (uint i = 0; i < 4; ++i) {
+        const uint c0 = taps[x0 + i], c1 = taps[p.ow + x0 + i];
+        v[i] = avg2(avg2(src[r0 + c0], src[r0 + c1]), avg2(src[r1 + c0], src[r1 + c1]));
+    }
+    dst[((p.oy + g.y) * p.dstWords + p.ox + x0) / 4] = v;
+}

@@ -34,6 +34,7 @@ struct Stats {
     uint32_t lastMs;    // the GPU copy's time for the last frame
     uint64_t totalMs;   // and for all frames (the mean is totalMs / (frames + failures))
     int scaleError;     // Presenter::scaleError(): why a logical-size frame could not be scaled (0 none)
+    uint64_t importsKept;   // frames whose import was kept from an earlier swap of the same kernel mapping
 };
 
 class Client {
@@ -82,7 +83,7 @@ public:
         note(0x6730);   // a frame was offered
         const uint64_t began = mach_absolute_time();
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
-                                                          (size_t)swap.stride, swap.width, swap.height});
+                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved});
         {
             static mach_timebase_info_data_t base;
             if (!base.denom) mach_timebase_info(&base);
@@ -91,7 +92,8 @@ public:
         }
         stats_->lastResult = (int)r;
         stats_->scaleError = presenter_->scaleError();
-        if (r == gpupresent::kOk && stats_->verified < 4 && swap.width == scanout_.width && swap.height == scanout_.height) verify(swap);
+        stats_->importsKept = presenter_->importsKept();
+        if (r == gpupresent::kOk && !swap.reserved && stats_->verified < 4 && swap.width == scanout_.width && swap.height == scanout_.height) verify(swap);
         note(0x6731);   // the GPU copy returned
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
