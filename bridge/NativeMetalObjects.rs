@@ -180,10 +180,10 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         if std::env::var("NGPU_UNORM8_FILTER").as_deref() != Ok("exact") {
             options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
         }
-        // The render server (backboardd, whose CARenderServer composites the UI) is trusted system code: its shaders skip the
-        // translator's containment of every access and the isolation between guests. Keyed on the process itself, not on anything a
-        // client could set; every other process keeps the untrusted-guest policy.
-        if trusted_process() {
+        // Opt-in (NGPU_TRUSTED_RENDER_SERVER=1 in the plugin's gpu-env, default off: it bought no GPU time on the A630): the render
+        // server (backboardd) as trusted system code, its shaders without the translator's containment and guest isolation. Only
+        // that process can take it; every other process keeps the untrusted-guest policy.
+        if trusted_process() && std::env::var("NGPU_TRUSTED_RENDER_SERVER").as_deref() == Ok("1") {
             options.policy.containment = metal2vulkan::device::ContainmentPolicy::UnsafeOff;
             options.policy.isolation = metal2vulkan::device::GuestIsolation::Off;
         }
