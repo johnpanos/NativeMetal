@@ -25,6 +25,7 @@
 #include <mach/mach.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
+#include "PipelineCapture.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -372,12 +373,14 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 // ---- libraries, functions, states ----
 @interface NBLibrary : NBObject
 @property(nonatomic) NmbLibrary *handle;
+@property(nonatomic) std::string captureId;   // the pipeline capture's library id (PipelineCapture.h), empty when it is off
 @end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
+@property(nonatomic) std::string captureId;       // the pipeline capture's function id, empty when it is off
 @end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
@@ -462,7 +465,8 @@ static std::string quartzCoreCallers();
   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+ function.constantsText=text;function.captureId=pcap::function(_captureId,name.UTF8String,constants.data(),constants.size());
+ if(error)*error=nil;return (id<MTLFunction>)function;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
@@ -491,6 +495,7 @@ static std::string quartzCoreCallers();
  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
  if(!handle){journal(std::string("N ")+(name.UTF8String?:"(nil)")+" err="+(lastError().UTF8String?:"?"));return nil;}
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ function.captureId=pcap::function(_captureId,name.UTF8String,nullptr,0);
  return (id<MTLFunction>)function;
 }
 @end
@@ -504,6 +509,7 @@ static std::string quartzCoreCallers();
 @end
 @interface NBRenderPipeline : NBObject
 @property(nonatomic) NmbRenderPipeline *handle;
+@property(nonatomic) long captureId;   // the pipeline capture's render number, -1 when it is off
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
@@ -515,6 +521,7 @@ static std::string quartzCoreCallers();
 @end
 @interface NBSampler : NBObject
 @property(nonatomic) NmbSampler *handle;
+@property(nonatomic) std::string captureText;   // the pipeline capture's descriptor (PipelineCapture.h)
 @end
 @implementation NBSampler
 - (void)dealloc {nmb_sampler_release(_handle);}
@@ -522,6 +529,7 @@ static std::string quartzCoreCallers();
 @end
 @interface NBDepthStencil : NBObject
 @property(nonatomic) NmbDepthStencil *handle;
+@property(nonatomic) std::string captureText;   // the pipeline capture's descriptor
 @end
 @implementation NBDepthStencil
 - (void)dealloc {nmb_depth_stencil_release(_handle);}
@@ -597,6 +605,7 @@ static void notified(void *context,uint64_t value) {
 @end
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
+@property(nonatomic) std::shared_ptr<pcap::Bindings> capture;   // a render encoder's state for the pipeline capture, null when it is off
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
 @end
 static void waitForResource(id resource) {
@@ -613,6 +622,12 @@ static void waitForResource(id resource) {
  }
  gTimeResourceWait.add(began);
 }
+// A bound texture as the pipeline capture records it.
+static std::string captureTexture(NBTexture *texture) {
+ const char *over=texture.surface?"surface":texture.buffer?"buffer":nullptr;
+ return pcap::textureText(texture.descriptor,over,texture.offset,texture.rowBytes,texture.parent!=nil);
+}
+static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f":"k";}
 @implementation NBEncoder
 - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
 - (bool)check:(bool)ok what:(const char *)what {
@@ -632,19 +647,23 @@ static void waitForResource(id resource) {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
+ if(_capture)_capture->slots[std::string(captureStage(stage))+"b"+std::to_string(index)]=buffer?"{\"buffer\":"+std::to_string(buffer.length)+",\"offset\":"+std::to_string(offset&255)+"}":std::string();
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ if(_capture)_capture->slots[std::string(captureStage(stage))+"t"+std::to_string(index)]=texture?captureTexture((NBTexture *)texture):std::string();
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
+ if(_capture)_capture->slots[std::string(captureStage(stage))+"s"+std::to_string(index)]=sampler?[(NBSampler *)sampler captureText]:std::string();
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
+ if(_capture)_capture->slots[std::string(captureStage(stage))+"b"+std::to_string(index)]="{\"bytes\":"+std::to_string(length)+"}";
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
@@ -655,6 +674,11 @@ static void waitForResource(id resource) {
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
+ if(_capture) {
+  std::string &slot=_capture->slots[std::string(captureStage(stage))+"b"+std::to_string(index)];
+  const size_t at=slot.find(",\"offset\":");
+  if(at!=std::string::npos)slot=slot.substr(0,at)+",\"offset\":"+std::to_string(offset&255)+"}";
+ }
 }
 @end
 
@@ -697,6 +721,7 @@ static void waitForResource(id resource) {
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
+ if(self.capture)self.capture->pipeline=[(NBRenderPipeline *)state captureId];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
@@ -720,6 +745,7 @@ static void waitForResource(id resource) {
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
+ if(self.capture)self.capture->depthStencil=state?[(NBDepthStencil *)state captureText]:std::string("null");
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
@@ -733,6 +759,7 @@ static void waitForResource(id resource) {
 - (void)raster {
  NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
+ if(self.capture)self.capture->raster="["+std::to_string(cull.unsignedLongLongValue)+","+std::to_string(winding.unsignedLongLongValue)+","+std::to_string(fill.unsignedLongLongValue)+"]";
 }
 - (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
@@ -765,6 +792,7 @@ static void waitForResource(id resource) {
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
+ if(self.capture)pcap::draw(*self.capture,t,-1);
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
@@ -778,6 +806,7 @@ static void waitForResource(id resource) {
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
+ if(self.capture)pcap::draw(*self.capture,t,(long)k);
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)i {
@@ -941,7 +970,24 @@ static void scheduled(void *context);
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ NBRenderEncoder *encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ if(encoder && pcap::on()) {
+  // The pass as the pipeline capture records it: each attachment's texture format and samples, the render target's size and samples.
+  auto format=[](MTLRenderPassAttachmentDescriptor *a)->std::string {
+   if(!a.texture)return "null";
+   return "{\"format\":"+std::to_string((unsigned long)a.texture.pixelFormat)+",\"samples\":"+std::to_string((unsigned long)a.texture.sampleCount)+
+          ",\"type\":"+std::to_string((unsigned long)a.texture.textureType)+",\"load\":"+std::to_string((unsigned long)a.loadAction)+
+          ",\"store\":"+std::to_string((unsigned long)a.storeAction)+"}";
+  };
+  auto bindings=std::make_shared<pcap::Bindings>();
+  std::string text="{\"colors\":[";
+  int last=-1;for(int i=0;i<8;i++)if(d.colorAttachments[i].texture)last=i;
+  for(int i=0;i<=last;i++){if(i)text+=",";text+=format(d.colorAttachments[i]);}
+  text+="],\"depth\":"+format(d.depthAttachment)+",\"stencil\":"+format(d.stencilAttachment)+",\"width\":"+std::to_string((unsigned long)d.renderTargetWidth)+
+        ",\"height\":"+std::to_string((unsigned long)d.renderTargetHeight)+",\"samples\":"+std::to_string((unsigned long)d.defaultRasterSampleCount)+"}";
+  bindings->pass=text;encoder.capture=bindings;
+ }
+ return (id<MTLRenderCommandEncoder>)encoder;
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
@@ -1457,14 +1503,14 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.captureId=pcap::library(bytes,size);if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.captureId=pcap::library(bytes.bytes,bytes.length);if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
@@ -1486,6 +1532,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
+ pcap::compute([(NBFunction *)function captureId],nullptr,handle!=nullptr);
  if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
@@ -1498,6 +1545,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
+ pcap::compute([(NBFunction *)d.computeFunction captureId],d.label.UTF8String,handle!=nullptr);
  if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
@@ -1514,10 +1562,13 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+ NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
+ const long captureNumber=pcap::render(p,[(NBFunction *)d.vertexFunction captureId],d.fragmentFunction?[(NBFunction *)d.fragmentFunction captureId]:std::string(),
+                            d.label.UTF8String,d.alphaToCoverageEnabled,handle!=nullptr);
+ delete p;
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.captureId=captureNumber;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
 // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
 // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
@@ -1561,7 +1612,17 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
      (uint64_t)d.borderColor,(uint64_t)d.normalizedCoordinates,d.maxAnisotropy,(uint64_t)d.compareFunction,(uint64_t)d.lodAverage,d.lodMinClamp,d.lodMaxClamp};
  NmbSampler *handle=nmb_sampler_new(gDevice,&s);
  if(!handle){NBLOG(@"native-metal: sampler refused: %@",lastError());return nil;}
- NBSampler *sampler=[NBSampler new];sampler.handle=handle;return (id<MTLSamplerState>)sampler;
+ NBSampler *sampler=[NBSampler new];sampler.handle=handle;
+ if(pcap::on()) {
+  char e[512];
+  snprintf(e,sizeof e,"{\"min\":%llu,\"mag\":%llu,\"mip\":%llu,\"s\":%llu,\"t\":%llu,\"r\":%llu,\"border\":%llu,\"normalized\":%s,\"maxAniso\":%llu,"
+           "\"compare\":%llu,\"lodAverage\":%s,\"lodMin\":%g,\"lodMax\":%g}",(unsigned long long)s.min_filter,(unsigned long long)s.mag_filter,
+           (unsigned long long)s.mip_filter,(unsigned long long)s.s_address,(unsigned long long)s.t_address,(unsigned long long)s.r_address,
+           (unsigned long long)s.border_color,s.normalized?"true":"false",(unsigned long long)s.max_anisotropy,(unsigned long long)s.compare,
+           s.lod_average?"true":"false",(double)s.lod_min,(double)s.lod_max);
+  sampler.captureText=e;
+ }
+ return (id<MTLSamplerState>)sampler;
 }
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
  auto face=[](MTLStencilDescriptor *s)->NmbStencil {
@@ -1570,7 +1631,15 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbDepthStencilDescriptor s={(uint64_t)d.depthCompareFunction,(uint64_t)d.depthWriteEnabled,face(d.frontFaceStencil),face(d.backFaceStencil)};
  NmbDepthStencil *handle=nmb_depth_stencil_new(gDevice,&s);
  if(!handle){NBLOG(@"native-metal: depth/stencil state refused: %@",lastError());return nil;}
- NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;return (id<MTLDepthStencilState>)state;
+ NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;
+ if(pcap::on()) {
+  char e[512];
+  snprintf(e,sizeof e,"{\"compare\":%llu,\"write\":%s,\"stencil\":{\"compare\":%llu,\"fail\":%llu,\"depthFail\":%llu,\"pass\":%llu,\"read\":%llu,\"write\":%llu}}",
+           (unsigned long long)s.compare,s.write?"true":"false",(unsigned long long)s.front.compare,(unsigned long long)s.front.failure,
+           (unsigned long long)s.front.depth_failure,(unsigned long long)s.front.pass,(unsigned long long)s.front.read_mask,(unsigned long long)s.front.write_mask);
+  state.captureText=e;
+ }
+ return (id<MTLDepthStencilState>)state;
 }
 @end
 
@@ -1613,6 +1682,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ pcap::begin(cache);if(pcap::on())journal("X capture "+pcap::dir());
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
