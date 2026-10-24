@@ -549,6 +549,7 @@ static std::string quartzCoreCallers();
 @end
 @interface NBComputePipeline : NBObject
 @property(nonatomic) NmbComputePipeline *handle;
+@property(nonatomic) long captureId;   // the pipeline capture's compute number, -1 when it is off
 @end
 @implementation NBComputePipeline
 - (void)dealloc {nmb_compute_pipeline_release(_handle);}
@@ -651,11 +652,164 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
 @end
+
+// ---- frame capture (NGPU_CAPTURE with NGPU_CAPTURE_FRAMES=N, diagnostics) ----
+// N command buffers after the first NGPU_CAPTURE_SKIP (default 0) the process makes, written as metal2vulkan command-replay records into the
+// pipeline capture's directory (frames.jsonl, blob-<hash>.bin): each resource at its first use in the window (a texture's level 0 of each
+// slice where its contents are read before they are written, a buffer's bytes at each commit that finds them changed), samplers and
+// depth/stencil states, and every encoder's commands in order. Resources are made alone (heap placement is not kept); a view is a view of
+// its parent's first level and slice. metal2vulkan scripts/pipeline-census/frames_manifest.py builds the manifest.
+namespace fcap {
+static std::recursive_mutex gLock;
+static long gSkip=0,gCount=0;static std::atomic<long> gMade{0};static bool gArmed=false;
+static std::unordered_map<const void *,std::string> gIds;   // resource -> key, for the window
+static NSMutableArray *gKeep;                                 // the window's resources, alive while their ids are
+static std::unordered_map<std::string,uint64_t> gHashes;      // buffer id -> hash of its last recorded bytes
+static std::set<uint64_t> gBlobs;
+static unsigned gNext=0;
+static thread_local bool gInternal=false;                     // a command buffer the capture makes itself
+static void arm() {
+ const char *n=getenv("NGPU_CAPTURE_FRAMES"),*s=getenv("NGPU_CAPTURE_SKIP");
+ gCount=n?atol(n):0;gSkip=s?atol(s):0;gArmed=pcap::on() && gCount>0;
+ if(gArmed){gKeep=[NSMutableArray array];journal("X frames "+std::to_string(gCount)+" after "+std::to_string(gSkip));}
+}
+// The command buffer's index in the window, or -1.
+static long begin() {
+ if(!gArmed || gInternal)return -1;
+ const long n=gMade.fetch_add(1);
+ return n>=gSkip && n<gSkip+gCount?n-gSkip:-1;
+}
+static void record(const std::string &line) {
+ std::lock_guard<std::recursive_mutex> guard(gLock);
+ if(FILE *f=fopen((pcap::dir()+"/frames.jsonl").c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
+}
+static uint64_t hash(const void *bytes,size_t n) {
+ uint64_t h=0xcbf29ce484222325ull;const uint8_t *p=(const uint8_t *)bytes;size_t i=0;
+ for(;i+8<=n;i+=8){uint64_t w;memcpy(&w,p+i,8);h=(h^w)*0x100000001b3ull;h^=h>>29;}
+ for(;i<n;i++)h=(h^p[i])*0x100000001b3ull;
+ return h^n;
+}
+// The bytes as a blob file, written once per content; its name.
+static std::string blob(const void *bytes,size_t n) {
+ const uint64_t h=hash(bytes,n);char name[48];snprintf(name,sizeof name,"blob-%016llx.bin",(unsigned long long)h);
+ std::lock_guard<std::recursive_mutex> guard(gLock);
+ if(gBlobs.insert(h).second)if(FILE *f=fopen((pcap::dir()+"/"+name).c_str(),"wb")){fwrite(bytes,1,n,f);fclose(f);}
+ return name;
+}
+static std::string named(id object,const char *prefix,bool *fresh) {
+ std::lock_guard<std::recursive_mutex> guard(gLock);
+ auto at=gIds.find((__bridge const void *)object);
+ if(at!=gIds.end()){if(fresh)*fresh=false;return at->second;}
+ const std::string key=prefix+std::to_string(gNext++);gIds[(__bridge const void *)object]=key;[gKeep addObject:object];
+ if(fresh)*fresh=true;
+ return key;
+}
+}  // namespace fcap
+// One command buffer's records in the window, and one encoder's.
+struct FrameCb {long index;std::vector<std::string> encoders;NSMutableArray *buffers=[NSMutableArray array];};
+struct FrameEncoder {std::string kind,head;std::vector<std::string> commands;std::map<std::string,std::pair<std::string,uint64_t>> slots;};
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic) std::shared_ptr<pcap::Bindings> capture;   // a render encoder's state for the pipeline capture, null when it is off
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+@property(nonatomic) std::shared_ptr<FrameEncoder> frame;   // the frame capture's record of this encoder, null outside the window
 @end
+@interface NBCommandBuffer ()
+@property(nonatomic) std::shared_ptr<FrameCb> frame;   // the frame capture's record of this command buffer, null outside the window
+@end
+namespace fcap {
+static std::string buffer(NBBuffer *b,FrameCb *cb) {
+ if(!b)return "null";
+ bool fresh=false;const std::string key=named(b,"b",&fresh);
+ if(fresh)record("{\"buffer\":\""+key+"\",\"length\":"+std::to_string((unsigned long long)b.length)+",\"options\":"+std::to_string((unsigned long long)b.options)+"}");
+ if(cb)[cb->buffers addObject:b];
+ return key;
+}
+// Level 0 of each slice, rows packed, read back for a texture whose contents the window reads before it writes them; empty when it cannot.
+static std::string contents(NBTexture *t) {
+ const NmbTextureDescriptor d=t.descriptor;
+ const uint64_t texel=nmb_device_linear_bytes_per_row(gDevice,d.format,256)/256;
+ if(!texel || d.samples>1 || !(d.type==2 || d.type==3 || d.type==5 || d.type==1))return std::string();
+ const uint64_t row=texel*d.width,image=row*d.height,slices=std::max<uint64_t>(d.array_length,1)*(d.type==5?6:1);
+ std::vector<uint8_t> bytes(image*slices);
+ waitForResource(t);
+ const uint64_t region[6]={0,0,0,d.width,d.height,1};
+ bool ok=true;
+ for(uint64_t s=0;s<slices && ok;s++)ok=nmb_texture_get_bytes(t.handle,bytes.data()+s*image,row,image,image,region,0,s);
+ if(!ok) {
+  // A private texture: copied through a blit on a queue of the capture's own, which is not captured.
+  static id<MTLCommandQueue> queue;static std::once_flag once;
+  std::call_once(once,[]{queue=[(id<MTLDevice>)gDeviceObject newCommandQueue];});
+  gInternal=true;
+  id<MTLBuffer> staging=[(id<MTLDevice>)gDeviceObject newBufferWithLength:bytes.size() options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> cb=[queue commandBuffer];id<MTLBlitCommandEncoder> blit=[cb blitCommandEncoder];
+  for(uint64_t s=0;s<slices;s++)
+   [blit copyFromTexture:(id<MTLTexture>)t sourceSlice:s sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(d.width,d.height,1)
+                toBuffer:staging destinationOffset:s*image destinationBytesPerRow:row destinationBytesPerImage:image];
+  [blit endEncoding];[cb commit];[cb waitUntilCompleted];
+  gInternal=false;
+  if(!staging.contents || cb.status!=MTLCommandBufferStatusCompleted)return std::string();
+  memcpy(bytes.data(),staging.contents,bytes.size());
+ }
+ return blob(bytes.data(),bytes.size());
+}
+// A texture's key; its record (and its parent's, its buffer's) at its first use. `read`: the use reads the contents it starts with.
+static std::string texture(NBTexture *t,bool read,FrameCb *cb) {
+ if(!t)return "null";
+ if(t.buffer)buffer(t.buffer,cb);
+ bool fresh=false;const std::string key=named(t,"t",&fresh);
+ if(!fresh)return key;
+ const NmbTextureDescriptor d=t.descriptor;
+ if([(id)t.parent isKindOfClass:[NBTexture class]]) {
+  const std::string of=texture((NBTexture *)t.parent,read,cb);
+  record("{\"view\":\""+key+"\",\"of\":\""+of+"\",\"format\":"+std::to_string(d.format)+",\"type\":"+std::to_string(d.type)+",\"levels\":[0,"+
+         std::to_string(std::max<uint64_t>(d.levels,1))+"],\"slices\":[0,"+std::to_string(std::max<uint64_t>(d.array_length,1)*(d.type==5?6:1))+"]}");
+  return key;
+ }
+ std::string s="{\"texture\":\""+key+"\",\"type\":"+std::to_string(d.type)+",\"format\":"+std::to_string(d.format)+",\"width\":"+std::to_string(d.width)+
+     ",\"height\":"+std::to_string(d.height)+",\"depth\":"+std::to_string(std::max<uint64_t>(d.depth,1))+",\"levels\":"+std::to_string(std::max<uint64_t>(d.levels,1))+
+     ",\"samples\":"+std::to_string(std::max<uint64_t>(d.samples,1))+",\"array\":"+std::to_string(std::max<uint64_t>(d.array_length,1))+",\"usage\":"+
+     std::to_string(d.usage)+",\"options\":"+std::to_string(d.options);
+ if(t.buffer) {
+  s+=",\"buffer\":\""+named(t.buffer,"b",nullptr)+"\",\"offset\":"+std::to_string((unsigned long long)t.offset)+",\"row\":"+std::to_string((unsigned long long)t.rowBytes);
+  if(t.surface)s+=",\"surface\":true";
+ } else if(read) {
+  const std::string file=contents(t);
+  if(!file.empty())s+=",\"file\":\""+file+"\"";else s+=",\"contents\":\"unread\"";
+ }
+ record(s+"}");
+ return key;
+}
+static std::string sampler(NBSampler *s) {
+ if(!s)return "null";
+ bool fresh=false;const std::string key=named(s,"s",&fresh);
+ if(fresh)record("{\"sampler\":\""+key+"\",\"descriptor\":"+(s.captureText.empty()?std::string("{}"):s.captureText)+"}");
+ return key;
+}
+static std::string depthStencil(NBDepthStencil *d) {
+ if(!d)return "null";
+ bool fresh=false;const std::string key=named(d,"d",&fresh);
+ if(fresh)record("{\"depthStencil\":\""+key+"\",\"descriptor\":"+(d.captureText.empty()?std::string("{}"):d.captureText)+"}");
+ return key;
+}
+// At commit: the bytes of every buffer the command buffer names that changed since they were last recorded, then its encoders.
+static void commit(FrameCb *cb) {
+ std::string uploads;
+ for(NBBuffer *b in cb->buffers) {
+  void *bytes=b.contents;if(!bytes)continue;
+  const std::string key=named(b,"b",nullptr);const size_t n=b.length;
+  const uint64_t h=hash(bytes,n);
+  {std::lock_guard<std::recursive_mutex> guard(gLock);auto at=gHashes.find(key);if(at!=gHashes.end() && at->second==h)continue;gHashes[key]=h;}
+  uploads+=(uploads.empty()?"":",")+std::string("{\"buffer\":\"")+key+"\",\"file\":\""+blob(bytes,n)+"\"}";
+ }
+ std::string s="{\"commandBuffer\":"+std::to_string(cb->index)+",\"uploads\":["+uploads+"],\"encoders\":[";
+ for(size_t i=0;i<cb->encoders.size();i++)s+=(i?",":"")+cb->encoders[i];
+ record(s+"]}");
+}
+static const char *stageName(uint32_t stage) {return stage==1?"vertex":stage==2?"fragment":"kernel";}
+static std::string num(double v) {char e[40];snprintf(e,sizeof e,"%.9g",v);return e;}
+static std::string triple(uint64_t a,uint64_t b,uint64_t c) {return "["+std::to_string(a)+","+std::to_string(b)+","+std::to_string(c)+"]";}
+}  // namespace fcap
 static void waitForResource(id resource) {
  const uint64_t began=nowUs();
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
@@ -686,7 +840,13 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
  NmbEncoder *handle=_handle;_handle=nullptr;
  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
  [self check:nmb_encoder_end(handle) what:"endEncoding"];
+ if(_frame && _commandBuffer.frame) {
+  std::string s="{\""+_frame->kind+"\":{"+_frame->head+(_frame->head.empty()?"":",")+"\"commands\":[";
+  for(size_t i=0;i<_frame->commands.size();i++)s+=(i?",":"")+_frame->commands[i];
+  _commandBuffer.frame->encoders.push_back(s+"]}}");_frame=nullptr;
+ }
 }
+- (void)frameCommand:(const std::string &)command {if(_frame)_frame->commands.push_back(command);}
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
 - (void)pushDebugGroup:(NSString *)s {(void)s;}
 - (void)popDebugGroup {}
@@ -695,6 +855,11 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
+ if(_frame && buffer) {
+  const std::string id=fcap::buffer((NBBuffer *)buffer,_commandBuffer.frame.get());
+  _frame->slots[std::to_string(stage)+":"+std::to_string(index)]={id,offset};
+  _frame->commands.push_back(std::string("{\"buffer\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"buffer\":\""+id+"\",\"offset\":"+std::to_string(offset)+"}}");
+ }
  if(_capture)_capture->slots[std::string(captureStage(stage))+"b"+std::to_string(index)]=buffer?"{\"buffer\":"+std::to_string(buffer.length)+",\"offset\":"+std::to_string(offset&255)+"}":std::string();
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
@@ -702,15 +867,21 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ if(_frame && texture)_frame->commands.push_back(std::string("{\"texture\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"texture\":\""+
+     fcap::texture((NBTexture *)texture,true,_commandBuffer.frame.get())+"\"}}");
  if(_capture)_capture->slots[std::string(captureStage(stage))+"t"+std::to_string(index)]=texture?captureTexture((NBTexture *)texture):std::string();
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
+ if(_frame && sampler)_frame->commands.push_back(std::string("{\"sampler\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"sampler\":\""+
+     fcap::sampler((NBSampler *)sampler)+"\"}}");
  if(_capture)_capture->slots[std::string(captureStage(stage))+"s"+std::to_string(index)]=sampler?[(NBSampler *)sampler captureText]:std::string();
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
+ if(_frame)_frame->commands.push_back(std::string("{\"bytes\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"hex\":\""+
+     pcap::hexOf(bytes,length)+"\"}}");
  if(_capture)_capture->slots[std::string(captureStage(stage))+"b"+std::to_string(index)]="{\"bytes\":"+std::to_string(length)+"}";
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
@@ -722,6 +893,11 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
+ if(_frame) {
+  auto at=_frame->slots.find(std::to_string(stage)+":"+std::to_string(index));
+  if(at!=_frame->slots.end()){at->second.second=offset;
+   _frame->commands.push_back(std::string("{\"buffer\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"buffer\":\""+at->second.first+"\",\"offset\":"+std::to_string(offset)+"}}");}
+ }
  if(_capture) {
   std::string &slot=_capture->slots[std::string(captureStage(stage))+"b"+std::to_string(index)];
   const size_t at=slot.find(",\"offset\":");
@@ -737,6 +913,7 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
  [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
+ [self frameCommand:"{\"pipeline\":\"c"+std::to_string([(NBComputePipeline *)state captureId])+"\"}"];
 }
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
 - (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:0];}
@@ -751,11 +928,14 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
 - (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:0];}
 - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
  [self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"];
+ [self frameCommand:"{\"threadgroupMemory\":{\"index\":"+std::to_string((unsigned long long)(i))+",\"length\":"+std::to_string((unsigned long long)(n))+"}}"];
 }
 - (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
  [self check:nmb_compute_dispatch(self.handle,s,g,threads) what:"dispatch"];
+ [self frameCommand:threads?"{\"dispatchThreads\":{\"grid\":"+fcap::triple(s[0],s[1],s[2])+",\"threads\":"+fcap::triple(g[0],g[1],g[2])+"}}":
+     "{\"dispatchThreadgroups\":{\"groups\":"+fcap::triple(s[0],s[1],s[2])+",\"threads\":"+fcap::triple(g[0],g[1],g[2])+"}}"];
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
@@ -770,6 +950,7 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
  if(self.capture)self.capture->pipeline=[(NBRenderPipeline *)state captureId];
+ [self frameCommand:"{\"pipeline\":\"r"+std::to_string([(NBRenderPipeline *)state captureId])+"\"}"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
@@ -793,15 +974,18 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
+ if(self.frame && state)[self frameCommand:"{\"depthStencil\":\""+fcap::depthStencil((NBDepthStencil *)state)+"\"}"];
  if(self.capture)self.capture->depthStencil=state?[(NBDepthStencil *)state captureText]:std::string("null");
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
+ if(self.frame){std::string s="{\"viewport\":[";for(int i=0;i<6;i++)s+=(i?",":"")+fcap::num(values[i]);[self frameCommand:s+"]}"];}
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
+ if(self.frame)[self frameCommand:"{\"scissor\":["+std::to_string(values[0])+","+std::to_string(values[1])+","+std::to_string(values[2])+","+std::to_string(values[3])+"]}"];
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
 - (void)raster {
@@ -809,11 +993,12 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
  if(self.capture)self.capture->raster="["+std::to_string(cull.unsignedLongLongValue)+","+std::to_string(winding.unsignedLongLongValue)+","+std::to_string(fill.unsignedLongLongValue)+"]";
 }
-- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
-- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
-- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
+- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];[self frameCommand:"{\"cull\":"+std::to_string((unsigned long long)(m))+"}"];}
+- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];[self frameCommand:"{\"winding\":"+std::to_string((unsigned long long)(w))+"}"];}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];[self frameCommand:"{\"fill\":"+std::to_string((unsigned long long)(f))+"}"];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
+ [self frameCommand:"{\"depthBias\":["+fcap::num(bias)+","+fcap::num(slope)+","+fcap::num(clamp)+"]}"];
 }
 - (void)setLineWidth:(float)width {[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
@@ -830,17 +1015,20 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
 - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];}
+- (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];[self frameCommand:"{\"stencilRef\":"+std::to_string(v)+"}"];}
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
  [self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];
+ [self frameCommand:"{\"stencilRef\":"+std::to_string(f)+"}"];
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
+ [self frameCommand:"{\"blendColor\":["+fcap::num(r)+","+fcap::num(g)+","+fcap::num(b)+","+fcap::num(a)+"]}"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
  if(self.capture)pcap::draw(*self.capture,t,-1);
+ [self frameCommand:"{\"draw\":{\"primitive\":"+std::to_string((unsigned long long)(t))+",\"start\":"+std::to_string((unsigned long long)(s))+",\"count\":"+std::to_string((unsigned long long)(n))+",\"instances\":"+std::to_string((unsigned long long)(i))+",\"baseInstance\":"+std::to_string((unsigned long long)(b))+"}}"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
@@ -855,6 +1043,8 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
  if(self.capture)pcap::draw(*self.capture,t,(long)k);
+ if(self.frame)[self frameCommand:"{\"drawIndexed\":{\"primitive\":"+std::to_string((unsigned long long)(t))+",\"count\":"+std::to_string((unsigned long long)(n))+",\"indexType\":"+std::to_string((unsigned long long)(k))+",\"buffer\":\""+
+     fcap::buffer((NBBuffer *)b,self.commandBuffer.frame.get())+"\",\"offset\":"+std::to_string((unsigned long long)(o))+",\"instances\":"+std::to_string((unsigned long long)(i))+",\"baseVertex\":"+std::to_string((long long)v)+",\"baseInstance\":"+std::to_string((unsigned long long)(bi))+"}}"];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)i {
@@ -891,16 +1081,20 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
  [self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"];
+ if(self.frame)[self frameCommand:"{\"copyBuffer\":{\"from\":\""+fcap::buffer((NBBuffer *)s,self.commandBuffer.frame.get())+"\",\"fromOffset\":"+std::to_string((unsigned long long)(so))+",\"to\":\""+fcap::buffer((NBBuffer *)d,self.commandBuffer.frame.get())+"\",\"toOffset\":"+std::to_string((unsigned long long)(dO))+",\"size\":"+std::to_string((unsigned long long)(n))+"}}"];
 }
 - (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {
  if(![self buffers:NB_OBJECTS(b) count:1])return;
  [self check:nmb_blit_fill_buffer(self.handle,[(NBBuffer *)b handle],r.location,r.location+r.length,v) what:"fillBuffer"];
+ if(self.frame)[self frameCommand:"{\"fillBuffer\":{\"buffer\":\""+fcap::buffer((NBBuffer *)b,self.commandBuffer.frame.get())+"\",\"offset\":"+std::to_string((unsigned long long)(r.location))+",\"length\":"+std::to_string((unsigned long long)(r.length))+",\"value\":"+std::to_string((unsigned long long)(v))+"}}"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
+ if(self.frame)[self frameCommand:"{\"copyTexture\":{\"from\":\""+fcap::texture((NBTexture *)s,true,self.commandBuffer.frame.get())+"\",\"fromSlice\":"+std::to_string((unsigned long long)(ss))+",\"fromLevel\":"+std::to_string((unsigned long long)(sl))+",\"fromOrigin\":"+fcap::triple(a[0],a[1],a[2])+
+     ",\"size\":"+fcap::triple(size[0],size[1],size[2])+",\"to\":\""+fcap::texture((NBTexture *)d,false,self.commandBuffer.frame.get())+"\",\"toSlice\":"+std::to_string((unsigned long long)(ds))+",\"toLevel\":"+std::to_string((unsigned long long)(dl))+",\"toOrigin\":"+fcap::triple(b[0],b[1],b[2])+"}}"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
@@ -917,16 +1111,21 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
+ if(self.frame)[self frameCommand:"{\"bufferToTexture\":{\"buffer\":\""+fcap::buffer((NBBuffer *)s,self.commandBuffer.frame.get())+"\",\"offset\":"+std::to_string((unsigned long long)(o))+",\"row\":"+std::to_string((unsigned long long)(row))+",\"image\":"+std::to_string((unsigned long long)(image))+
+     ",\"size\":"+fcap::triple(size[0],size[1],size[2])+",\"texture\":\""+fcap::texture((NBTexture *)d,false,self.commandBuffer.frame.get())+"\",\"slice\":"+std::to_string((unsigned long long)(slice))+",\"level\":"+std::to_string((unsigned long long)(level))+",\"origin\":"+fcap::triple(b[0],b[1],b[2])+"}}"];
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
+ if(self.frame)[self frameCommand:"{\"textureToBuffer\":{\"texture\":\""+fcap::texture((NBTexture *)s,true,self.commandBuffer.frame.get())+"\",\"slice\":"+std::to_string((unsigned long long)(slice))+",\"level\":"+std::to_string((unsigned long long)(level))+",\"origin\":"+fcap::triple(a[0],a[1],a[2])+
+     ",\"size\":"+fcap::triple(size[0],size[1],size[2])+",\"buffer\":\""+fcap::buffer((NBBuffer *)d,self.commandBuffer.frame.get())+"\",\"offset\":"+std::to_string((unsigned long long)(o))+",\"row\":"+std::to_string((unsigned long long)(row))+",\"image\":"+std::to_string((unsigned long long)(image))+"}}"];
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
+ if(self.frame)[self frameCommand:"{\"generateMipmaps\":\""+fcap::texture((NBTexture *)t,true,self.commandBuffer.frame.get())+"\"}"];
 }
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
 @end
@@ -973,7 +1172,9 @@ static void scheduled(void *context);
 - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
- encoder.handle=handle;encoder.commandBuffer=self;return encoder;
+ encoder.handle=handle;encoder.commandBuffer=self;
+ if(_frame){auto f=std::make_shared<FrameEncoder>();f->kind=[encoder isKindOfClass:[NBRenderEncoder class]]?"render":[encoder isKindOfClass:[NBComputeEncoder class]]?"compute":"blit";encoder.frame=f;}
+ return encoder;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
  return [self encoder:[NBComputeEncoder new] handle:self.committed?nullptr:nmb_compute_encoder_new(_handle) what:@"computeCommandEncoder"];
@@ -1019,6 +1220,24 @@ static void scheduled(void *context);
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
  NBRenderEncoder *encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ if(encoder && encoder.frame) {
+  FrameCb *cb=_frame.get();
+  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,const std::string &clear)->std::string {
+   if(![(id)a.texture isKindOfClass:[NBTexture class]])return "null";
+   return "{\"texture\":\""+fcap::texture((NBTexture *)a.texture,a.loadAction==MTLLoadActionLoad,cb)+"\",\"load\":"+std::to_string((unsigned long)a.loadAction)+
+          ",\"store\":"+std::to_string((unsigned long)a.storeAction)+",\"level\":"+std::to_string((unsigned long)a.level)+",\"slice\":"+std::to_string((unsigned long)a.slice)+",\"clear\":"+clear+"}";
+  };
+  std::string head="\"colors\":[";int last=-1;for(int i=0;i<8;i++)if(d.colorAttachments[i].texture)last=i;
+  for(int i=0;i<=last;i++) {
+   MTLClearColor c=d.colorAttachments[i].clearColor;
+   head+=(i?",":"")+attachment(d.colorAttachments[i],"["+fcap::num(c.red)+","+fcap::num(c.green)+","+fcap::num(c.blue)+","+fcap::num(c.alpha)+"]");
+  }
+  head+="]";
+  if(d.depthAttachment.texture)head+=",\"depth\":"+attachment(d.depthAttachment,fcap::num(d.depthAttachment.clearDepth));
+  if(d.stencilAttachment.texture)head+=",\"stencil\":"+attachment(d.stencilAttachment,std::to_string((unsigned long)d.stencilAttachment.clearStencil));
+  head+=",\"width\":"+std::to_string((unsigned long)d.renderTargetWidth)+",\"height\":"+std::to_string((unsigned long)d.renderTargetHeight);
+  encoder.frame->head=head;
+ }
  if(encoder && pcap::on()) {
   // The pass as the pipeline capture records it: each attachment's texture format and samples, the render target's size and samples.
   auto format=[](MTLRenderPassAttachmentDescriptor *a)->std::string {
@@ -1095,6 +1314,7 @@ static void scheduled(void *context);
 - (void)commit {
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
+ if(_frame){fcap::commit(_frame.get());_frame=nullptr;}
  self.committedUs=nowUs();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -1157,7 +1377,9 @@ static void completed(void *context) {
 - (id<MTLCommandBuffer>)commandBuffer {
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
- NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;return (id<MTLCommandBuffer>)commandBuffer;
+ NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;
+ if(const long frame=fcap::begin();frame>=0){auto record=std::make_shared<FrameCb>();record->index=frame;commandBuffer.frame=record;}
+ return (id<MTLCommandBuffer>)commandBuffer;
 }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences {return [self commandBuffer];}
 - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here
@@ -1583,9 +1805,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
- pcap::compute([(NBFunction *)function captureId],nullptr,handle!=nullptr);
+ const long captureNumber=pcap::compute([(NBFunction *)function captureId],nullptr,handle!=nullptr);
  if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
- NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.captureId=captureNumber;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
@@ -1596,9 +1818,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
- pcap::compute([(NBFunction *)d.computeFunction captureId],d.label.UTF8String,handle!=nullptr);
+ const long captureNumber=pcap::compute([(NBFunction *)d.computeFunction captureId],d.label.UTF8String,handle!=nullptr);
  if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
- NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
+ NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;state.captureId=captureNumber;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
@@ -1734,6 +1956,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  pcap::begin(cache);if(pcap::on())journal("X capture "+pcap::dir());
+ fcap::arm();
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);

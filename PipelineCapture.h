@@ -13,6 +13,8 @@
 //   {"compute":N,"ok":0|1,"label":"...","function":"<id>"}
 // A function's id digests its library, name and constants, so every process names a function alike. The libraries are the
 // caller's (Apple's own shaders for the render server): pull them into a gitignored directory only, never commit them.
+// With NGPU_CAPTURE_FRAMES=N (NGPU_CAPTURE_SKIP=K) the frontend also records N command buffers as command-replay records (frames.jsonl, the
+// frame capture in NativeBridgeMetalFrontend.mm).
 #ifndef NATIVE_METAL_PIPELINE_CAPTURE_H
 #define NATIVE_METAL_PIPELINE_CAPTURE_H
 #include <CommonCrypto/CommonDigest.h>
@@ -143,9 +145,11 @@ inline long render(const NmbRenderPipelineDescriptor *p,const std::string &verte
  record(s+"}");
  return number;
 }
-inline void compute(const std::string &function,const char *label,bool ok) {
- if(!on())return;
- record("{\"compute\":"+std::to_string(next())+",\"ok\":"+(ok?"1":"0")+",\"label\":"+quote(label)+",\"function\":\""+function+"\"}");
+inline long compute(const std::string &function,const char *label,bool ok) {
+ if(!on())return -1;
+ const long number=(long)next();
+ record("{\"compute\":"+std::to_string(number)+",\"ok\":"+(ok?"1":"0")+",\"label\":"+quote(label)+",\"function\":\""+function+"\"}");
+ return number;
 }
 // A render encoder's state as its draws key their pipelines: the pass, each stage's bindings by slot ("v"/"f" + "b"/"t"/"s" + index),
 // the depth/stencil state and the raster state. A draw's record is written once per distinct state (buffer offsets modulo 256).
