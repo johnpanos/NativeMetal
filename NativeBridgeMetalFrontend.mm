@@ -143,6 +143,11 @@ static void waitForResource(id resource);
 @property(nonatomic) BOOL importNoFlush,importFlushed;
 @property(nonatomic) uint32_t importSeed;
 @property(nonatomic) BOOL hostCounted;   // counted in gHostLive (noteHostRange)
+// NGPU_HOST_COPY=1: a no-copy buffer stood in by a GPU-owned copy of the caller's bytes, refreshed at every commit; the caller's
+// deallocator runs when the buffer goes.
+@property(nonatomic) void *copySource;
+@property(nonatomic) NSUInteger copyBytes;
+@property(nonatomic,copy) void (^copyDeallocator)(void *,NSUInteger);
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -168,6 +173,7 @@ static void hostBufferGone(void *base);
 - (void)dealloc {
  nmb_buffer_release(_handle);
  if(_hostCounted)hostBufferGone(_wrapped);
+ if(_copyDeallocator)_copyDeallocator(_copySource,_copyBytes);
 }
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
 - (void *)contents {return nmb_buffer_contents(_handle);}
@@ -209,10 +215,17 @@ static void registerImport(NBBuffer *buffer,IOSurfaceRef surface,void *base,size
 // hold new data: a surface when its seed moved (CPU writers lock and unlock it, which advances the seed), a plain no-copy buffer always,
 // unless the presenter marked it as written only by the GPU. Cleaning a range nothing dirtied costs as much as a dirty one, so the seed
 // is what saves the work (a static wallpaper is 11 MiB).
+static std::atomic<uint64_t> gHostCopies,gHostCopyBytes;
 static void flushImports() {
  NSArray *imports;
  {std::lock_guard<std::mutex> lock(gImportLock);imports=gImports.allObjects;}
  for(NBBuffer *buffer in imports) {
+  if(buffer.copySource) {   // NGPU_HOST_COPY=2: the caller's current bytes into the GPU's copy at every commit (=1: at creation only)
+   static const bool everyCommit=[]{const char *v=getenv("NGPU_HOST_COPY");return v && v[0]=='2';}();
+   if(everyCommit)
+    if(void *into=nmb_buffer_contents(buffer.handle)){const uint64_t began=nowUs();memcpy(into,buffer.copySource,buffer.copyBytes);gTimeImportFlush.add(began);gHostCopies++;gHostCopyBytes+=buffer.copyBytes;}
+   continue;
+  }
   if(buffer.importNoFlush || !buffer.wrapped || !buffer.importBytes)continue;
   uint32_t seed=0;
   if(buffer.importSurface) {
@@ -263,7 +276,9 @@ static void noteHostRange(void *base,size_t length) {
   std::lock_guard<std::mutex> lock(gHostRangeLock);
   auto it=gHostRanges.find((uintptr_t)base);
   const bool live=gHostLive.count((uintptr_t)base)!=0;
-  if(it!=gHostRanges.end() && !live)remapped=true;   // seen before, no buffer over it alive now
+  // Seen before, and either no buffer over it is alive now, or the VM object there changed (the owner unmapped it and mapped other
+  // memory: its old pages are gone for every buffer over it).
+  if(it!=gHostRanges.end() && (!live || it->second.second!=object || it->second.first!=length))remapped=true;
   gHostRanges[(uintptr_t)base]={length,object};
  }
  if(remapped){gHostRemaps++;nmb_device_host_range_remapped(gDevice,base,length);}
@@ -1508,6 +1523,17 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
 }
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
+ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return v && (v[0]=='1' || v[0]=='2');}();
+ // Up to 4 MiB (backing stores, images); a larger range (a framebuffer the presenter reads) stays a no-copy import.
+ if(copyMode && !(options&MTLResourceStorageModePrivate) && length<=(4u<<20)) {
+  NmbBuffer *owned=nmb_buffer_new(gDevice,length,options&~MTLResourceStorageModeMask,pointer);
+  if(!owned){NBLOG(@"native-metal: host copy refused: %@",lastError());return nil;}
+  gNoCopyAll++;gHostCopies++;gHostCopyBytes+=length;
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=owned;buffer.options=options;
+  buffer.copySource=pointer;buffer.copyBytes=length;buffer.copyDeallocator=deallocator;
+  {std::lock_guard<std::mutex> lock(gImportLock);if(!gImports)gImports=[NSHashTable weakObjectsHashTable];[gImports addObject:buffer];}
+  return (id<MTLBuffer>)buffer;
+ }
  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
  // Joins an earlier import of its range only while a buffer over it is alive (noteHostRange).
  noteHostRange(pointer,length);
@@ -1900,6 +1926,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
+ row("N host copies %llu bytes %llu",(unsigned long long)gHostCopies.load(),(unsigned long long)gHostCopyBytes.load());
  row("N host remaps %llu ranges %llu",(unsigned long long)gHostRemaps.load(),(unsigned long long)[]{std::lock_guard<std::mutex> l(gHostRangeLock);return gHostRanges.size();}());
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
