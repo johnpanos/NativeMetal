@@ -169,6 +169,13 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         if std::env::var("NGPU_UNORM8_FILTER").as_deref() == Ok("device") {
             options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
         }
+        // NGPU_TRUSTED=1 (the plugin's gpu-env): the process is trusted system code (the render server), so its shaders skip
+        // the translator's containment of every access and the isolation between guests (the untrusted-guest policy's
+        // in-shader resource table lookups and bounds checks).
+        if std::env::var("NGPU_TRUSTED").as_deref() == Ok("1") {
+            options.policy.containment = metal2vulkan::device::ContainmentPolicy::UnsafeOff;
+            options.policy.isolation = metal2vulkan::device::GuestIsolation::Off;
+        }
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
     })
 }
