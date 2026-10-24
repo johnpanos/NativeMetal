@@ -322,9 +322,13 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
  Method method=class_getInstanceMethod(object_getClass(object),selector);
  return method && !strcmp(method_getTypeEncoding(method),encoding);
 }
-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
+// Bytes of a function constant of MTLDataType `type`. 3-wide vectors are their packed elements: iOS 16 QuartzCore specializes its uber
+// shaders with uchar3 constants (MTLDataTypeUChar3, 51), which iPadOS 17's never used.
 static uint64_t constantBytes(uint64_t type) {
  switch(type) {
+  case 5:case 31:case 35:return 12;     // float3, int3, uint3
+  case 18:case 39:case 43:return 6;     // half3, short3, ushort3
+  case 47:case 51:case 55:return 3;     // char3, uchar3, bool3
   case 3:case 29:case 33:return 4;
   case 4:case 30:case 34:return 8;
   case 6:case 32:case 36:return 16;
