@@ -1422,13 +1422,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(!url){if(error)*error=nbError(@"the bundle has no default.metallib");return nil;}
  return [(id<MTLDevice>)self newLibraryWithURL:url error:error];
 }
-// iOS 16 QuartzCore opens its pipeline library (QuartzCore.framework/default.pipelinelib, Apple GPU binaries) with this private
-// call; the _MTLDevice base implementation dereferences a builder the native device never creates (backboardd SIGSEGV, fajita
-// session-201609). There is no pipeline library for this GPU: answer nil with an error, and QuartzCore compiles its pipelines.
-- (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error {
- if(error)*error=nbError([NSString stringWithFormat:@"no pipeline library on this GPU (%@)",path.lastPathComponent?:@"?"]);
- return nil;
-}
 - (id<MTLLibrary>)newDefaultLibrary {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];}
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {
  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
