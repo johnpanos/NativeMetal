@@ -180,6 +180,12 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         if std::env::var("NGPU_UNORM8_FILTER").as_deref() != Ok("exact") {
             options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
         }
+        // NGPU_PADDED_READS=shadow (the plugin's gpu-env): a padded read-only texture over a buffer (a CPU-drawn IOSurface's rows)
+        // is the runtime's shadow image, copied in before each use, instead of an image aliasing the buffer's bytes whose first
+        // layout move this translator keeps through a host read-back that can undo the CPU's writes in that window.
+        if std::env::var("NGPU_PADDED_READS").as_deref() == Ok("shadow") {
+            options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::Shadow;
+        }
         // Opt-in (NGPU_TRUSTED_RENDER_SERVER=1 in the plugin's gpu-env, default off: it bought no GPU time on the A630): the render
         // server (backboardd) as trusted system code, its shaders without the translator's containment and guest isolation. Only
         // that process can take it; every other process keeps the untrusted-guest policy.
