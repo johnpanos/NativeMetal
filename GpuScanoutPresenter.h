@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include <string.h>
 
+// The native frontend's opt-out from its commit-time cleaning of imports (NativeBridgeMetalFrontend.mm): the frame is CoreAnimation's GPU
+// output, which no CPU wrote. A no-op elsewhere (the Mac's device for the host check); the frontend's definition replaces this one.
+extern "C" __attribute__((weak)) void NBImportNoFlush(id buffer) {(void)buffer;}
+
 namespace gpupresent {
 
 struct Scanout {
@@ -54,6 +58,7 @@ public:
         if (scaled && !prepareScale(frame.width, frame.height)) return kBadFrame;
         id<MTLBuffer> source = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
         if (!source) return kNoResource;
+        NBImportNoFlush(source);
         if (scaled) return presentScaled(source, frame);
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;

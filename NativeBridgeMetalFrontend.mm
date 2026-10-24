@@ -135,6 +135,12 @@ static void waitForResource(id resource);
 @property(nonatomic) void *wrapped;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
+// Imports (no-copy buffers and IOSurface pages): the CPU range the commit-time cleaning covers (flushImports), the surface whose seed
+// says whether its pixels changed since the last clean, and the presenter's opt-out for frames only the GPU wrote.
+@property(nonatomic) IOSurfaceRef importSurface;
+@property(nonatomic) NSUInteger importBytes;
+@property(nonatomic) BOOL importNoFlush,importFlushed;
+@property(nonatomic) uint32_t importSeed;
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -183,6 +189,42 @@ NB_RESOURCE_SPI
 // caller-owned no-copy buffers do not enter this cache.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
+// Every live import of this process, for the commit-time cleaning (flushImports). Weak: an import leaves when its buffer object goes.
+static std::mutex gImportLock;
+static NSHashTable *gImports;
+static std::atomic<uint64_t> gImportFlushes,gImportFlushBytes,gImportSeedSkips;
+static Timed gTimeImportFlush;
+static void registerImport(NBBuffer *buffer,IOSurfaceRef surface,void *base,size_t bytes) {
+ buffer.wrapped=base;buffer.importSurface=surface;buffer.importBytes=bytes;
+ std::lock_guard<std::mutex> lock(gImportLock);
+ if(!gImports)gImports=[NSHashTable weakObjectsHashTable];
+ [gImports addObject:buffer];
+}
+// The kernel does not maintain read-only imports per submission on a board that sets fajita-gpu-ro-skip (the ABI's contract: the
+// importer cleans its caches before GPU use). Before a command runs, every live import of this process is cleaned once its CPU range may
+// hold new data: a surface when its seed moved (CPU writers lock and unlock it, which advances the seed), a plain no-copy buffer always,
+// unless the presenter marked it as written only by the GPU. Cleaning a range nothing dirtied costs as much as a dirty one, so the seed
+// is what saves the work (a static wallpaper is 11 MiB).
+static void flushImports() {
+ NSArray *imports;
+ {std::lock_guard<std::mutex> lock(gImportLock);imports=gImports.allObjects;}
+ for(NBBuffer *buffer in imports) {
+  if(buffer.importNoFlush || !buffer.wrapped || !buffer.importBytes)continue;
+  uint32_t seed=0;
+  if(buffer.importSurface) {
+   seed=IOSurfaceGetSeed(buffer.importSurface);
+   if(buffer.importFlushed && seed==buffer.importSeed){gImportSeedSkips++;continue;}
+  }
+  const uint64_t began=nowUs();
+  sys_dcache_flush(buffer.wrapped,buffer.importBytes);
+  gTimeImportFlush.add(began);gImportFlushes++;gImportFlushBytes+=buffer.importBytes;
+  buffer.importSeed=seed;buffer.importFlushed=YES;
+ }
+}
+// The presenter's frame source: CoreAnimation's GPU-rendered surface, which no CPU writes; cleaning it would cost a frame's size each time.
+extern "C" void NBImportNoFlush(id buffer) {
+ if([(id)buffer isKindOfClass:[NBBuffer class]])((NBBuffer *)buffer).importNoFlush=YES;
+}
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
@@ -195,6 +237,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
  gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+ registerImport(buffer,surface,base,bytes);
  if(key) {
   // Bound metadata without retaining old frames. Evicting an association is
   // harmless: its owners still retain the actual import until their own end.
@@ -968,6 +1011,7 @@ static void scheduled(void *context);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
+  flushImports();
   flushSurfaces(_surfaces);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
@@ -1375,7 +1419,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;
  }
  gNoCopyAll++;if(context)gNoCopyMade++;
- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
+ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+ registerImport(buffer,nullptr,pointer,length);
  return (id<MTLBuffer>)buffer;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
@@ -1723,6 +1768,9 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
  row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
+ row("J import clean n=%llu bytes=%llu seed-skips=%llu us=%llu max=%llu",(unsigned long long)gImportFlushes.load(),
+  (unsigned long long)gImportFlushBytes.load(),(unsigned long long)gImportSeedSkips.load(),(unsigned long long)gTimeImportFlush.total.load(),
+  (unsigned long long)gTimeImportFlush.slowest.load());
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
