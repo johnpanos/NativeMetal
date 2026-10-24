@@ -33,6 +33,7 @@ struct Stats {
     uint64_t mismatchRows;   // rows of those frames that differ (CPU reads only: nothing is rendered or copied by the CPU)
     uint32_t lastMs;    // the GPU copy's time for the last frame
     uint64_t totalMs;   // and for all frames (the mean is totalMs / (frames + failures))
+    int scaleError;     // Presenter::scaleError(): why a logical-size frame could not be scaled (0 none)
 };
 
 class Client {
@@ -89,7 +90,8 @@ public:
             stats_->totalMs += stats_->lastMs;
         }
         stats_->lastResult = (int)r;
-        if (r == gpupresent::kOk && stats_->verified < 4) verify(swap);
+        stats_->scaleError = presenter_->scaleError();
+        if (r == gpupresent::kOk && stats_->verified < 4 && swap.width == scanout_.width && swap.height == scanout_.height) verify(swap);
         note(0x6731);   // the GPU copy returned
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);

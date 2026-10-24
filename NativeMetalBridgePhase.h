@@ -129,8 +129,8 @@ static void serveScanout(Gpu &gpu, id device) {
                     reportedFrames = st.frames ? st.frames : reportedFrames;
                     reportedFailures = st.failures ? st.failures : reportedFailures;
                     const uint64_t served = st.frames + st.failures;
-                    snprintf(line, sizeof line, "PF %llu/%llu r%d v%llu/%llu t%u a%llu", (unsigned long long)st.frames, (unsigned long long)st.failures,
-                             st.lastResult, (unsigned long long)st.verified, (unsigned long long)st.mismatchRows, st.lastMs,
+                    snprintf(line, sizeof line, "PF %llu/%llu r%d s%d v%llu/%llu t%u a%llu", (unsigned long long)st.frames, (unsigned long long)st.failures,
+                             st.lastResult, st.scaleError, (unsigned long long)st.verified, (unsigned long long)st.mismatchRows, st.lastMs,
                              (unsigned long long)(served ? st.totalMs / served : 0));
                     streamText7(gpu, line);
                 }
