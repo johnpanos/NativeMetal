@@ -149,6 +149,16 @@ impl NmbDevice {
     }
 }
 
+unsafe extern "C" {
+    fn getprogname() -> *const c_char;
+}
+/// The render server: the process the loader named backboardd (getprogname, from the executable's path).
+fn trusted_process() -> bool {
+    // SAFETY: getprogname returns the process's static name or null.
+    let name = unsafe { getprogname() };
+    !name.is_null() && unsafe { CStr::from_ptr(name) }.to_bytes() == b"backboardd"
+}
+
 /// # Safety
 /// `loader` and `cache` are C strings.
 #[unsafe(no_mangle)]
@@ -164,15 +174,16 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
-        // NGPU_UNORM8_FILTER=device (the plugin's gpu-env): the device's own 8-bit linear filter where the translator has the
-        // device's measured fact (Unorm8LinearFilter), instead of Metal's filter emulated exactly in each fragment function.
-        if std::env::var("NGPU_UNORM8_FILTER").as_deref() == Ok("device") {
+        // The device's own 8-bit linear filter where the translator has the device's measured fact (Unorm8LinearFilter: the
+        // Adreno 630's), instead of Metal's filter emulated exactly in each fragment function (~1,000 instructions on that GPU).
+        // NGPU_UNORM8_FILTER=exact (the plugin's gpu-env) keeps Metal's.
+        if std::env::var("NGPU_UNORM8_FILTER").as_deref() != Ok("exact") {
             options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
         }
-        // NGPU_TRUSTED=1 (the plugin's gpu-env): the process is trusted system code (the render server), so its shaders skip
-        // the translator's containment of every access and the isolation between guests (the untrusted-guest policy's
-        // in-shader resource table lookups and bounds checks).
-        if std::env::var("NGPU_TRUSTED").as_deref() == Ok("1") {
+        // The render server (backboardd, whose CARenderServer composites the UI) is trusted system code: its shaders skip the
+        // translator's containment of every access and the isolation between guests. Keyed on the process itself, not on anything a
+        // client could set; every other process keeps the untrusted-guest policy.
+        if trusted_process() {
             options.policy.containment = metal2vulkan::device::ContainmentPolicy::UnsafeOff;
             options.policy.isolation = metal2vulkan::device::GuestIsolation::Off;
         }
