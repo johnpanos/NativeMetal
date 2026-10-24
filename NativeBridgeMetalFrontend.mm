@@ -316,6 +316,15 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  }
  return buffer;
 }
+// Extended-range 10-bit formats (BGRA10_XR, BGR10_XR and their sRGB forms, 550-555) on the render server's own textures and pipelines
+// are RGBA16Float: the translator stores XR as R32G32_UINT and packs, blends and unpacks it in each fragment function (fajita census:
+// fixed_frag_lph_cph at 1,062-1,184 IR3 instructions); RGBA16Float holds the same extended range and the A630 blends it in hardware.
+// Textures over IOSurfaces or buffers keep their format (their bytes are XR). NGPU_XR_AS_F16=0 keeps XR everywhere.
+static uint64_t xrFormat(uint64_t format) {
+ static const bool on=[]{const char *v=getenv("NGPU_XR_AS_F16");return !(v && v[0]=='0');}();
+ return on && format>=550 && format<=555 ? (uint64_t)MTLPixelFormatRGBA16Float : format;
+}
+static std::atomic<uint64_t> gXrTextures,gXrPipelines;
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
@@ -1529,7 +1538,8 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
-  p->colors[i]={(uint64_t)a.pixelFormat,(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
+  if(xrFormat((uint64_t)a.pixelFormat)!=(uint64_t)a.pixelFormat)gXrPipelines++;
+  p->colors[i]={xrFormat((uint64_t)a.pixelFormat),(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
       (uint64_t)a.rgbBlendOperation,(uint64_t)a.sourceAlphaBlendFactor,(uint64_t)a.destinationAlphaBlendFactor,(uint64_t)a.alphaBlendOperation};
  }
  p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=d.rasterSampleCount;
@@ -1581,6 +1591,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 }
 - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ if(xrFormat(descriptor.format)!=descriptor.format){descriptor.format=xrFormat(descriptor.format);gXrTextures++;}
  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
  if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
@@ -1774,6 +1785,7 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ if(xrFormat(descriptor.format)!=descriptor.format){descriptor.format=xrFormat(descriptor.format);gXrTextures++;}
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
  if(!handle){NBLOG(@"native-metal: texture refused (format %lu %lux%lux%lu type %lu usage %lx storage %lu samples %lu): %@",(unsigned long)d.pixelFormat,
   (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.textureType,(unsigned long)d.usage,(unsigned long)d.storageMode,
@@ -2151,6 +2163,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
+ row("N xr as f16: textures %llu pipelines %llu",(unsigned long long)gXrTextures.load(),(unsigned long long)gXrPipelines.load());
  row("N host copies %llu bytes %llu",(unsigned long long)gHostCopies.load(),(unsigned long long)gHostCopyBytes.load());
  row("N host remaps %llu ranges %llu",(unsigned long long)gHostRemaps.load(),(unsigned long long)[]{std::lock_guard<std::mutex> l(gHostRangeLock);return gHostRanges.size();}());
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
