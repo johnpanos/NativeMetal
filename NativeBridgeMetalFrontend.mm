@@ -231,7 +231,9 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
- NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+ // NGPU_SURFACE_CACHE=0 (the plugin's gpu-env, diagnostics): every surface texture imports its pages anew.
+ static const bool noCache=[]{const char *v=getenv("NGPU_SURFACE_CACHE");return v && v[0]=='0';}();
+ NBBuffer *buffer=key && !noCache?[gSurfaceImports objectForKey:key]:nil;
  if(buffer)return buffer;
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
