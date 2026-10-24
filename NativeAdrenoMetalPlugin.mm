@@ -266,6 +266,12 @@ static id deviceForPort(unsigned port) {
         }
         // The render server compresses its framebuffer (an Apple/AGX layout this GPU does not write) unless told not to; the display driver takes plain rows.
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+        // Turnip's own messages (vk_errorf: which allocation or bind failed and why) into a file beside the shader cache.
+        if (const passwd *user = getpwuid(getuid()); user && user->pw_dir) {
+            static char mesaLog[512];
+            snprintf(mesaLog, sizeof mesaLog, "%s/Library/Caches/com.apple.backboardd/mesa.log", user->pw_dir);
+            setenv("MESA_LOG_FILE", mesaLog, 0);
+        }
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums.
         setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);

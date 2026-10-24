@@ -303,7 +303,11 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
  const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
  NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
   IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chroma>=base?chroma-base:0,IOSurfaceGetBytesPerRowOfPlane(surface,1));
- if(!handle){NBLOG(@"native-metal: texture over surface refused: %@",lastError());return nil;}
+ if(!handle){
+  const uint32_t code=IOSurfaceGetPixelFormat(surface);const char fourcc[5]={char(code>>24),char(code>>16),char(code>>8),char(code),0};
+  NBLOG(@"native-metal: texture over surface refused (format %lu %lux%lu usage %lx surface '%s' plane %lu row %lu): %@",(unsigned long)d.pixelFormat,
+   (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.usage,fourcc,(unsigned long)plane,(unsigned long)row,lastError());return nil;
+ }
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
@@ -1377,7 +1381,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
- if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+ if(!handle){NBLOG(@"native-metal: texture refused (format %lu %lux%lux%lu type %lu usage %lx storage %lu samples %lu): %@",(unsigned long)d.pixelFormat,
+  (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.textureType,(unsigned long)d.usage,(unsigned long)d.storageMode,
+  (unsigned long)d.sampleCount,lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
 }
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
