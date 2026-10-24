@@ -164,6 +164,11 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
+        // NGPU_UNORM8_FILTER=device (the plugin's gpu-env): the device's own 8-bit linear filter where the translator has the
+        // device's measured fact (Unorm8LinearFilter), instead of Metal's filter emulated exactly in each fragment function.
+        if std::env::var("NGPU_UNORM8_FILTER").as_deref() == Ok("device") {
+            options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
+        }
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
     })
 }
