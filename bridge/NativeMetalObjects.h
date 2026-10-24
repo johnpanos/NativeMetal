@@ -68,6 +68,7 @@ NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, u
  * buffer and every command buffer using them are gone). A refused call (NULL) never runs it. */
 NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
                                             void (*release)(void *context, void *pointer, uint64_t length), void *context);
+void nmb_device_host_range_remapped(NmbDevice *device, void *pointer, uint64_t length);
 void nmb_buffer_release(NmbBuffer *);
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
