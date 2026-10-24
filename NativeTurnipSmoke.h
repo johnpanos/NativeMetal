@@ -15,8 +15,10 @@
 #include <vulkan/vulkan_core.h>
 #include "NativeTurnipShaders.h"   // generated: scripts/gen-turnip-smoke-shaders.py
 #include <dlfcn.h>
+#if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#endif
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -542,6 +544,7 @@ static Result run(Marker &&mark, const char *libraryPath) {
     return out;
 }
 
+#if defined(__APPLE__)   // the watchdog samples the worker with Mach thread calls; the Linux host check calls run() directly
 // Watchdog. run() executes on a worker thread; if it has not returned after 15, 45 and 90 seconds, the calling thread samples the worker and
 // sends "W <last marker> s<run state> u<user us>/k<system us> over 300 ms, then the stack": the PC, LR and frame-pointer return addresses, each
 // as <image letter><offset in that image> (v = libvulkan_freedreno.dylib; offsets resolve against the unstripped build). A worker that is
@@ -637,6 +640,8 @@ static Result runWatched(Marker &mark, Reporter &&report, const char *libraryPat
     delete w;
     return result;
 }
+
+#endif
 
 // Path of libvulkan_freedreno.dylib: next to the image this code is part of (the plugin binary inside the bundle).
 static bool libraryPath(char *path, size_t size) {
