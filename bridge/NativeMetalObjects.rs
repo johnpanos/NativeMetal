@@ -180,12 +180,6 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         if std::env::var("NGPU_UNORM8_FILTER").as_deref() != Ok("exact") {
             options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
         }
-        // NGPU_PADDED_READS=shadow (the plugin's gpu-env): a padded read-only texture over a buffer (a CPU-drawn IOSurface's rows)
-        // is the runtime's shadow image, copied in before each use, instead of an image aliasing the buffer's bytes whose first
-        // layout move this translator keeps through a host read-back that can undo the CPU's writes in that window.
-        if std::env::var("NGPU_PADDED_READS").as_deref() == Ok("shadow") {
-            options.policy.padded_reads = metal2vulkan::device::PaddedReadsPolicy::Shadow;
-        }
         // Opt-in (NGPU_TRUSTED_RENDER_SERVER=1 in the plugin's gpu-env, default off: it bought no GPU time on the A630): the render
         // server (backboardd) as trusted system code, its shaders without the translator's containment and guest isolation. Only
         // that process can take it; every other process keeps the untrusted-guest policy.
@@ -617,6 +611,21 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
             unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) }
         };
         Ok(boxed(NmbBuffer(buffer.map_err(e("no-copy buffer"))?)))
+    })
+}
+
+/// The caller's host range [pointer, pointer + length) now holds other pages than when a no-copy buffer was last made over it (its
+/// owner unmapped it and mapped new memory there): live buffers made over it leave it, so the next no-copy buffer imports the pages
+/// mapped now instead of joining an import of the old ones (Device::host_range_remapped).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_host_range_remapped(device: *mut NmbDevice, pointer: *mut c_void, length: u64) {
+    guard((), || {
+        let device = get(device)?;
+        if let Some(bytes) = NonNull::new(pointer as *mut u8) {
+            let _gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            device.0.host_range_remapped(bytes, length);
+        }
+        Ok(())
     })
 }
 

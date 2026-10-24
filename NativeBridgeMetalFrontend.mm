@@ -142,6 +142,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NSUInteger importBytes;
 @property(nonatomic) BOOL importNoFlush,importFlushed;
 @property(nonatomic) uint32_t importSeed;
+@property(nonatomic) BOOL hostCounted;   // counted in gHostLive (noteHostRange)
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -162,9 +163,11 @@ static void releaseBlock(void *context,void *pointer,uint64_t length) {
  void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
 }
 static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
+static void hostBufferGone(void *base);
 @implementation NBBuffer
 - (void)dealloc {
  nmb_buffer_release(_handle);
+ if(_hostCounted)hostBufferGone(_wrapped);
 }
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
 - (void *)contents {return nmb_buffer_contents(_handle);}
@@ -226,6 +229,49 @@ static void flushImports() {
 extern "C" void NBImportNoFlush(id buffer) {
  if([(id)buffer isKindOfClass:[NBBuffer class]])((NBBuffer *)buffer).importNoFlush=YES;
 }
+
+// Same address, new pages: Core Animation frees a backing store (vm_deallocate) once its no-copy buffer is released while the runtime may
+// still hold that buffer's import, and maps a new one at the same address later. The runtime joins a new no-copy buffer over a live
+// import of the same bytes, which would leave it over the old pages (fajita: wrong icons and labels while Settings scrolled; the kernel's
+// import check counted pages REPLACED under live imports). A new buffer over a range seen before, with no buffer over it alive now,
+// reports the range remapped first, so it imports the pages mapped there now; while one is alive (two textures of one IOSurface, a
+// buffer the owner still holds) it keeps the runtime's join. NGPU_HOST_REMAP=0 turns this off.
+static std::mutex gHostRangeLock;
+static std::unordered_map<uintptr_t,std::pair<uint64_t,uint32_t>> gHostRanges;   // base -> (length, VM object id)
+static std::atomic<uint64_t> gHostRemaps;
+static uint32_t hostObject(void *base) {
+ vm_address_t address=(vm_address_t)base;vm_size_t size=0;natural_t depth=64;
+ vm_region_submap_info_data_64_t info={};mach_msg_type_number_t count=VM_REGION_SUBMAP_INFO_COUNT_64;
+ if(vm_region_recurse_64(mach_task_self(),&address,&size,&depth,(vm_region_recurse_info_t)&info,&count)!=KERN_SUCCESS)return 0;
+ if(address>(vm_address_t)base)return 0;   // nothing mapped at base
+ return info.object_id;
+}
+// Live no-copy buffers (plain and IOSurface) per base address: a range may join an earlier import only while a buffer over it is still
+// alive (its owner cannot have freed the memory then); once every buffer over it is gone, the owner may have unmapped and remapped it.
+static std::unordered_map<uintptr_t,uint32_t> gHostLive;
+static void hostBufferGone(void *base) {
+ std::lock_guard<std::mutex> lock(gHostRangeLock);
+ auto it=gHostLive.find((uintptr_t)base);
+ if(it!=gHostLive.end() && it->second && !--it->second)gHostLive.erase(it);
+}
+static void noteHostRange(void *base,size_t length) {
+ static const bool off=[]{const char *v=getenv("NGPU_HOST_REMAP");return v && v[0]=='0';}();
+ if(off || !base || !length)return;
+ const uint32_t object=hostObject(base);
+ bool remapped=false;
+ {
+  std::lock_guard<std::mutex> lock(gHostRangeLock);
+  auto it=gHostRanges.find((uintptr_t)base);
+  const bool live=gHostLive.count((uintptr_t)base)!=0;
+  if(it!=gHostRanges.end() && !live)remapped=true;   // seen before, no buffer over it alive now
+  gHostRanges[(uintptr_t)base]={length,object};
+ }
+ if(remapped){gHostRemaps++;nmb_device_host_range_remapped(gDevice,base,length);}
+}
+static void countHostBuffer(NBBuffer *buffer,void *base) {
+ std::lock_guard<std::mutex> lock(gHostRangeLock);
+ ++gHostLive[(uintptr_t)base];buffer.hostCounted=YES;
+}
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
@@ -237,10 +283,12 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  NBBuffer *buffer=key && !noCache?[gSurfaceImports objectForKey:key]:nil;
  if(buffer)return buffer;
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+ noteHostRange(base,bytes);
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
  gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
  registerImport(buffer,surface,base,bytes);
+ countHostBuffer(buffer,base);
  if(key) {
   // Bound metadata without retaining old frames. Evicting an association is
   // harmless: its owners still retain the actual import until their own end.
@@ -1461,6 +1509,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
+ // Joins an earlier import of its range only while a buffer over it is alive (noteHostRange).
+ noteHostRange(pointer,length);
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
  if(!handle) {
   if(context)(void)(__bridge_transfer id)context;
@@ -1469,6 +1519,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  gNoCopyAll++;if(context)gNoCopyMade++;
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
  registerImport(buffer,nullptr,pointer,length);
+ countHostBuffer(buffer,pointer);
  return (id<MTLBuffer>)buffer;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
@@ -1849,6 +1900,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
+ row("N host remaps %llu ranges %llu",(unsigned long long)gHostRemaps.load(),(unsigned long long)[]{std::lock_guard<std::mutex> l(gHostRangeLock);return gHostRanges.size();}());
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
