@@ -33,6 +33,7 @@ struct Frame {
     size_t bytes;     // allocation size, a multiple of the page size
     size_t stride;
     uint32_t width, height;
+    uint32_t mapId;   // NGPSwap.reserved: nonzero when the kernel keeps this mapping across swaps, so its import can be kept too
 };
 
 enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
@@ -56,9 +57,8 @@ public:
             (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
         const bool scaled = frame.width != scanout_.width || frame.height != scanout_.height;
         if (scaled && !prepareScale(frame.width, frame.height)) return kBadFrame;
-        id<MTLBuffer> source = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> source = import(frame);
         if (!source) return kNoResource;
-        NBImportNoFlush(source);
         if (scaled) return presentScaled(source, frame);
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
@@ -85,10 +85,58 @@ public:
         }
         [blit endEncoding];
         [commands commit];
+        return finish(commands, frame);
+    }
+    uint64_t importsKept() const { return kept_; }
+    uint64_t pipelined() const { return pipelined_; }
+    uint64_t importsMade() const { return made_; }
+private:
+    // The frame's pages as a no-copy buffer. A mapping the kernel keeps (mapId) keeps its import: the kernel's cache holds as many entries and
+    // evicts its least recently used one as this does, on the same sequence of frames, so an id dropped here is one the kernel released.
+    // Pipelined presentation (a kept import only; NGPU_PRESENT_PIPELINE=0 turns it off): the frame's copy is committed and the call returns
+    // once the PREVIOUS frame's copy has completed, so the swap is completed while the GPU still copies this frame. The compositor reuses a
+    // surface only after the swap that replaced it on screen completes, and by then its copy has retired (this wait), so no surface is
+    // rewritten under a copy; copies run in order on this queue, so the scanout still receives the frames in order.
+    id<MTLCommandBuffer> pending_ = nil;
+    uint64_t pipelined_ = 0;
+    static bool pipelineAllowed() {
+        static const bool on = [] {const char *v = getenv("NGPU_PRESENT_PIPELINE"); return !(v && v[0] == '0');}();
+        return on;
+    }
+    Result finish(id<MTLCommandBuffer> commands, const Frame &frame) {
+        id<MTLCommandBuffer> previous = pending_;
+        pending_ = nil;
+        if (previous) {
+            [previous waitUntilCompleted];
+            if (previous.status != MTLCommandBufferStatusCompleted) {[commands waitUntilCompleted]; return kGpuFailed;}
+        }
+        if (frame.mapId && pipelineAllowed()) {pending_ = commands; ++pipelined_; return kOk;}
         [commands waitUntilCompleted];
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
-private:
+    static const unsigned kImports = 4;
+    struct Import { uint32_t mapId; const void *base; size_t bytes; uint64_t used; id<MTLBuffer> buffer; };
+    Import imports_[kImports] = {};
+    uint64_t clock_ = 0, kept_ = 0, made_ = 0;
+    id<MTLBuffer> import(const Frame &frame) {
+        if (frame.mapId)
+            for (Import &e : imports_)
+                if (e.buffer && e.mapId == frame.mapId && e.base == frame.base && e.bytes == frame.bytes) {e.used = ++clock_; ++kept_; return e.buffer;}
+        id<MTLBuffer> buffer = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (!buffer) return nil;
+        NBImportNoFlush(buffer);
+        ++made_;
+        if (frame.mapId) {
+            Import *victim = &imports_[0];
+            for (Import &e : imports_) {
+                if (!e.buffer) {victim = &e; break;}
+                if (e.used < victim->used) victim = &e;
+            }
+            victim->buffer = nil;
+            *victim = {frame.mapId, frame.base, frame.bytes, ++clock_, buffer};
+        }
+        return buffer;
+    }
     struct ScaleParams { uint32_t ow, oh, ox, oy, srcWords, dstWords; };
     // The pipeline once, and the fit and taps whenever the logical size changes (native_legacy_scale_fit / _taps, same rounding).
     bool prepareScale(uint32_t lw, uint32_t lh) {
@@ -108,6 +156,10 @@ private:
             if (!function) return scaleFail(3);
             pipeline_ = [device_ newComputePipelineStateWithFunction:function error:&error];
             if (!pipeline_) return scaleFail(4);
+            // The 16-byte-store variant (NGPU_SCALE4=0 keeps the scalar kernel); an older metallib without it keeps the scalar one too.
+            const char *v4 = getenv("NGPU_SCALE4");
+            id<MTLFunction> function4 = v4 && v4[0] == '0' ? nil : [library newFunctionWithName:@"scanout_scale4"];
+            if (function4) pipeline4_ = [device_ newComputePipelineStateWithFunction:function4 error:&error];
         }
         if (lw == mapW_ && lh == mapH_ && taps_) return true;
         taps_ = nil; mapW_ = mapH_ = 0; letterboxed_ = false;
@@ -157,17 +209,19 @@ private:
         if (!compute) return kNoResource;
         ScaleParams p = params_;
         p.srcWords = (uint32_t)(frame.stride / 4);
-        [compute setComputePipelineState:pipeline_];
+        const bool wide = pipeline4_ && !(p.ow % 4) && !(p.ox % 4) && !(p.dstWords % 4);
+        [compute setComputePipelineState:wide ? pipeline4_ : pipeline_];
         [compute setBuffer:source offset:0 atIndex:0];
         [compute setBuffer:target_ offset:0 atIndex:1];
         [compute setBuffer:taps_ offset:0 atIndex:2];
         [compute setBytes:&p length:sizeof p atIndex:3];
         const MTLSize group = MTLSizeMake(16, 8, 1);
-        [compute dispatchThreadgroups:MTLSizeMake((p.ow + 15) / 16, (p.oh + 7) / 8, 1) threadsPerThreadgroup:group];
+        const uint32_t cols = wide ? p.ow / 4 : p.ow;
+        [compute dispatchThreadgroups:MTLSizeMake((cols + 15) / 16, (p.oh + 7) / 8, 1) threadsPerThreadgroup:group];
         [compute endEncoding];
         [commands commit];
-        [commands waitUntilCompleted];
-        if (commands.status != MTLCommandBufferStatusCompleted) return kGpuFailed;
+        const Result r = finish(commands, frame);
+        if (r != kOk) return r;
         letterboxed_ = true;
         return kOk;
     }
@@ -183,7 +237,7 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
-    id<MTLComputePipelineState> pipeline_ = nil;
+    id<MTLComputePipelineState> pipeline_ = nil, pipeline4_ = nil;
     id<MTLBuffer> taps_ = nil;
     ScaleParams params_ = {};
     uint32_t mapW_ = 0, mapH_ = 0;
