@@ -99,6 +99,9 @@ NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescripto
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
 /* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
+/* The owner's generation of a shadowed texture's bytes (an IOSurface's seed): a two-plane YCbCr texture converts its planes
+ * at an encoder only where it changed or a command wrote them since. 0 states nothing (every encoder converts). */
+bool nmb_texture_set_contents_generation(const NmbTexture *, uint64_t generation);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
 void nmb_texture_release(NmbTexture *);
 void nmb_texture_describe(const NmbTexture *, struct NmbTextureDescriptor *out);

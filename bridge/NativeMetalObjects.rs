@@ -840,6 +840,16 @@ pub extern "C" fn nmb_texture_set_purgeable_state(texture: *const NmbTexture, st
     })
 }
 
+/// The owner's generation of the bytes a shadowed texture lies over (`Texture::set_contents_generation`): the frontend
+/// passes an IOSurface's seed, so a two-plane YCbCr texture converts its planes only when they changed. 0 states nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_set_contents_generation(texture: *const NmbTexture, generation: u64) -> bool {
+    guard(false, || {
+        get(texture)?.0.set_contents_generation(generation);
+        Ok(true)
+    })
+}
+
 /// `setPurgeableState:` on a buffer, as on a texture.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_set_purgeable_state(buffer: *const NmbBuffer, state: u64) -> u64 {

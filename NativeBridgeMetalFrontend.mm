@@ -854,6 +854,16 @@ static std::string captureTexture(NBTexture *texture) {
  return pcap::textureText(texture.descriptor,over,texture.offset,texture.rowBytes,texture.parent!=nil);
 }
 static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f":"k";}
+// A texture over an IOSurface states the surface's contents to the runtime as its seed (plus one: 0 states nothing), so a
+// two-plane YCbCr texture converts its planes only when the seed changed or a command wrote them, not at every encoder
+// (session-103156: a 1105x1160 YCBCR8_420_2P surface converted every frame, 17.5 ms, 36% of GPU time). NGPU_YCBCR_SEED=0 (the
+// plugin's gpu-env) states nothing: every encoder converts, as before.
+static std::atomic<uint64_t> gSurfaceGenerations;
+static void noteSurfaceContents(NBTexture *texture) {
+ static const bool on=[]{const char *v=getenv("NGPU_YCBCR_SEED");return !(v && v[0]=='0');}();
+ if(!on || !texture.surface)return;
+ nmb_texture_set_contents_generation(texture.handle,(uint64_t)IOSurfaceGetSeed(texture.surface)+1);gSurfaceGenerations++;
+}
 @implementation NBEncoder
 - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
 - (bool)check:(bool)ok what:(const char *)what {
@@ -889,7 +899,10 @@ static const char *captureStage(uint32_t stage) {return stage==1?"v":stage==2?"f
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
- if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && [(NBTexture *)texture surface]) {
+  [_commandBuffer.surfaces addObject:texture];
+  noteSurfaceContents((NBTexture *)texture);
+ }
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
  if(_frame && texture)_frame->commands.push_back(std::string("{\"texture\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"texture\":\""+
      fcap::texture((NBTexture *)texture,true,_commandBuffer.frame.get())+"\"}}");
@@ -2164,6 +2177,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
  row("N xr as f16: textures %llu pipelines %llu",(unsigned long long)gXrTextures.load(),(unsigned long long)gXrPipelines.load());
+ row("N surface generations stated %llu",(unsigned long long)gSurfaceGenerations.load());
  row("N host copies %llu bytes %llu",(unsigned long long)gHostCopies.load(),(unsigned long long)gHostCopyBytes.load());
  row("N host remaps %llu ranges %llu",(unsigned long long)gHostRemaps.load(),(unsigned long long)[]{std::lock_guard<std::mutex> l(gHostRangeLock);return gHostRanges.size();}());
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
