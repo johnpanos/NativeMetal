@@ -345,6 +345,7 @@ static std::string quartzCoreCallers();
 - (void)dealloc {nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+  journal(std::string("C ")+(name.UTF8String?:"(nil)")+" unqualified constant values "+(values?class_getName(object_getClass(values)):"(nil)"));
   if(error)*error=nbError(@"unqualified function constant values");return nil;
  }
  MTLFunctionConstantValues *snapshot=[values copy];
@@ -353,11 +354,12 @@ static std::string quartzCoreCallers();
  for(unsigned group=0;group<2;group++)for(id value in (group?named:indexed)) {
   if(!methodABI(value,@selector(dataType),"Q16@0:8") || !methodABI(value,@selector(data),"^v16@0:8") ||
      !methodABI(value,group?@selector(name):@selector(index),group?"@16@0:8":"Q16@0:8")) {
+   journal(std::string("C ")+name.UTF8String+" unqualified constant value "+class_getName(object_getClass(value)));
    if(error)*error=nbError(@"unqualified constant value ABI");return nil;
   }
   id<NBOriginalConstantValue> v=value;
   const uint64_t bytes=constantBytes(v.dataType);
-  if(!bytes || !v.data){if(error)*error=nbError([NSString stringWithFormat:@"constant type %lu is not qualified",(unsigned long)v.dataType]);return nil;}
+  if(!bytes || !v.data){journal(std::string("C ")+name.UTF8String+" constant type "+std::to_string(v.dataType)+(group?std::string(" ")+(v.name.UTF8String?:"?"):std::string()));if(error)*error=nbError([NSString stringWithFormat:@"constant type %lu is not qualified",(unsigned long)v.dataType]);return nil;}
   constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
  }
  std::string text;
