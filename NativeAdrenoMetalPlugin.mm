@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <initializer_list>
 #include <pwd.h>
 #include <mach/mach.h>
 #include <objc/message.h>
@@ -250,6 +251,18 @@ static id deviceForPort(unsigned port) {
             if (getuid() != 0) bits |= 32;
             gDiagBits = bits;
             gpu->mark(0x6A00 | bits);
+            // The render server reads its framebuffer preferences before the Metal discovery reaches this plugin, so a first boot without
+            // them (a Data volume that does not keep cfprefsd's writes: fajita's RAM-seeded Data) picks a deep, compressed framebuffer the
+            // display refuses (verify_swap failed on every swap). Upstream seeds the preferences (add-gpu-plugin-data.py --publish); where
+            // they are missing, write them and let launchd start the render server again, once per boot (the /tmp marker).
+            if (!(bits & 1) && access("/tmp/ngpu-fb-preferences", F_OK) != 0) {
+                for (CFStringRef key : {CFSTR("CAEnableDeepFramebuffer"), CFSTR("CAEnableFramebufferCompression"), CFSTR("CAEnableIOSurfaceCompression")})
+                    CFPreferencesSetAppValue(key, kCFBooleanFalse, kCFPreferencesCurrentApplication);
+                CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+                if (FILE *marker = fopen("/tmp/ngpu-fb-preferences", "w")) fclose(marker);
+                gpu->mark(0x68f5);
+                _exit(0);
+            }
         }
         // The render server compresses its framebuffer (an Apple/AGX layout this GPU does not write) unless told not to; the display driver takes plain rows.
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
