@@ -183,6 +183,11 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // Opt-in (NGPU_TRUSTED_RENDER_SERVER=1 in the plugin's gpu-env, default off: it bought no GPU time on the A630): the render
         // server (backboardd) as trusted system code, its shaders without the translator's containment and guest isolation. Only
         // that process can take it; every other process keeps the untrusted-guest policy.
+        // NGPU_UNIFORM_OFFSET_SPEC=1 (gpu-env, an A/B, default off; metal2vulkan uniform-offset-low): a uniform view's loads read
+        // the bind offset's low four bits from a specialization constant, so Turnip places each load in its vector.
+        if std::env::var("NGPU_UNIFORM_OFFSET_SPEC").as_deref() == Ok("1") {
+            options.policy.uniform_offset = metal2vulkan::device::policy::UniformOffsetPolicy::Specialized;
+        }
         if trusted_process() && std::env::var("NGPU_TRUSTED_RENDER_SERVER").as_deref() == Ok("1") {
             options.policy.containment = metal2vulkan::device::ContainmentPolicy::UnsafeOff;
             options.policy.isolation = metal2vulkan::device::GuestIsolation::Off;
