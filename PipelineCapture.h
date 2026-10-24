@@ -74,9 +74,15 @@ inline std::string quote(const char *s) {
  }
  return out+"\"";
 }
+// capture.jsonl's size: past NGPU_CAPTURE_MAX bytes (default 3 MiB, what one pull over the USB hub takes in a few minutes) only the
+// libraries', functions' and pipelines' records are written, no more draw states.
+inline size_t &written() {static size_t n=0;return n;}
+inline size_t limit() {static const size_t n=[]{const char *v=getenv("NGPU_CAPTURE_MAX");return v?(size_t)atoll(v):(size_t)3<<20;}();return n;}
 inline void record(const std::string &line) {
  std::lock_guard<std::mutex> guard(lock());
  if(stopped())return;
+ if(written()>limit() && line.compare(0,8,"{\"draw\":")==0)return;
+ written()+=line.size()+1;
  if(FILE *f=fopen((dir()+"/capture.jsonl").c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
 // A library's id; its bytes are written once.

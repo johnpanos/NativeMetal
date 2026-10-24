@@ -687,7 +687,7 @@ static void arm() {
  const char *n=getenv("NGPU_CAPTURE_FRAMES"),*s=getenv("NGPU_CAPTURE_SKIP");
  const char *e=getenv("NGPU_CAPTURE_END");
  gCount=n?atol(n):0;gSkip=s?atol(s):0;gArmed=pcap::on() && gCount>0;
- gEnd=e?atol(e):gArmed?gSkip+gCount:600;
+ gEnd=e?atol(e):gArmed?0:600;   // a window ends the capture itself; NGPU_CAPTURE_END set ends it there in any case
  if(gArmed){gKeep=[NSMutableArray array];journal("X frames "+std::to_string(gCount)+" after "+std::to_string(gSkip));}
 }
 // The command buffer's index in the window, or -1.
@@ -834,13 +834,14 @@ static void commit(FrameCb *cb) {
  record(s+"]}");
  gWindowCommitted++;
 }
-// Each commit while the capture is on: the capture ends with the window's last command buffer (or 64 command buffers after a window
-// one never committed), or at NGPU_CAPTURE_END command buffers.
+// Each commit while the capture is on: the capture ends once the window's command buffers committed (or 64 command buffers were made
+// past the window, one of them never committed), or at NGPU_CAPTURE_END committed command buffers (default 600 without a window).
+// session-091248: ending at SKIP+FRAMES commits ended it before the window's own command buffers, made then, had committed.
 static void committed() {
  if(!pcap::on())return;
  const long n=++gCommitted;
  const bool windowDone=gArmed && (gWindowCommitted>=gCount || gMade>gSkip+gCount+64);
- if((gArmed && windowDone) || n>=gEnd) {
+ if((gArmed && windowDone) || (gEnd>0 && n>=gEnd)) {
   std::lock_guard<std::recursive_mutex> guard(gLock);
   pcap::finish("{\"commandBuffers\":"+std::to_string(n)+",\"frames\":"+std::to_string((long)gWindowCommitted)+",\"resources\":"+std::to_string(gNext)+"}");
   journal("X capture done after "+std::to_string(n)+" command buffers, "+std::to_string((long)gWindowCommitted)+" captured");
