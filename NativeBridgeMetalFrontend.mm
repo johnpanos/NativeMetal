@@ -1745,7 +1745,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
 }
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
- static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return v && (v[0]=='1' || v[0]=='2');}();
+ // Default (NGPU_HOST_COPY unset or 1): the runtime's host imports outlived their owners' memory and showed other icons and labels
+// (fajita Settings scroll); a GPU-owned copy made at creation is correct. NGPU_HOST_COPY=0: the no-copy import; 2: copy at every commit.
+static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v && v[0]=='0');}();
  // Up to 4 MiB (backing stores, images); a larger range (a framebuffer the presenter reads) stays a no-copy import.
  if(copyMode && !(options&MTLResourceStorageModePrivate) && length<=(4u<<20)) {
   NmbBuffer *owned=nmb_buffer_new(gDevice,length,options&~MTLResourceStorageModeMask,pointer);
