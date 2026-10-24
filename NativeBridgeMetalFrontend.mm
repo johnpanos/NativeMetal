@@ -382,21 +382,6 @@ static std::string quartzCoreCallers();
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
  handler(function,error);
 }
-// iOS 16 QuartzCore makes its specialized shaders with a function descriptor (CA::OGL::MetalContext::load_shader_function:
-// +[MTLFunctionDescriptor functionDescriptor], setName:, setConstantValues:, newFunctionWithDescriptor:error:) where iPadOS 17's
-// called newFunctionWithName:constantValues:error:. The descriptor's name and constant values are the same request.
-- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor error:(NSError **)error {
- if(!descriptor || !descriptor.name){if(error)*error=nbError(@"function descriptor without a name");return nil;}
- if(descriptor.specializedName.length && ![descriptor.specializedName isEqualToString:descriptor.name])
-  noteProblem([NSString stringWithFormat:@"function descriptor %@: specializedName %@ ignored",descriptor.name,descriptor.specializedName]);
- MTLFunctionConstantValues *values=descriptor.constantValues;
- if(!values)return [(id<MTLLibrary>)self newFunctionWithName:descriptor.name];
- return [self newFunctionWithName:descriptor.name constantValues:values error:error];
-}
-- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
- NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:descriptor error:&error];
- handler(function,error);
-}
 - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
 // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
 // runtime does when the function is made.
