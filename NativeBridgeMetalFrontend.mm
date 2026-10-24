@@ -390,6 +390,7 @@ static std::string quartzCoreCallers();
 // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
 // runtime does when the function is made.
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
+ journal(std::string("D ")+(d.name.UTF8String?:"(nil)")+(d.constantValues?" constants":"")+(d.specializedName?std::string(" as ")+d.specializedName.UTF8String:std::string()));
  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
  if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
  id<MTLFunction> function=[self newFunctionWithName:d.name];
@@ -406,7 +407,7 @@ static std::string quartzCoreCallers();
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
  const uint64_t functionBegan=nowUs();
  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
- if(!handle)return nil;
+ if(!handle){journal(std::string("N ")+(name.UTF8String?:"(nil)")+" err="+(lastError().UTF8String?:"?"));return nil;}
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  return (id<MTLFunction>)function;
 }
