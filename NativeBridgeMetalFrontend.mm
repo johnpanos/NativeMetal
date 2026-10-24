@@ -584,12 +584,40 @@ static std::string quartzCoreCallers();
 - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
 - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
 @end
-@interface NBRenderPipeline : NBObject
+@interface NBRenderPipeline : NBObject {
+@public
+ // NGPU_XR_AS_F16: the color attachments whose BGRA10_XR-family format the pipeline takes as RGBA16Float (bit i), the descriptor with the
+ // caller's formats and its functions, and the pipeline made from it once a pass of XR attachments (textures over IOSurfaces or buffers,
+ // which keep XR) sets it. Without it such a pass refused the command buffer: setRenderPipelineState AttachmentFormat(Color(0)),
+ // the App Library's backdrop black (session-163610).
+ uint32_t xrMask;
+ std::shared_ptr<NmbRenderPipelineDescriptor> xrDescriptor;
+ NmbRenderPipeline *xrHandle;
+ bool xrTried;
+}
 @property(nonatomic) NmbRenderPipeline *handle;
 @property(nonatomic) long captureId;   // the pipeline capture's render number, -1 when it is off
+@property(nonatomic,strong) id xrFunctions;   // keeps the descriptor's functions alive for the XR variant
+- (NmbRenderPipeline *)handleForXr:(uint32_t)passXr;
 @end
+static std::atomic<uint64_t> gXrVariants;
 @implementation NBRenderPipeline
-- (void)dealloc {nmb_render_pipeline_release(_handle);}
+- (void)dealloc {nmb_render_pipeline_release(_handle);if(xrHandle)nmb_render_pipeline_release(xrHandle);}
+// The pipeline for a pass whose XR color attachments are passXr: the caller's formats where the pass keeps XR on an attachment this
+// pipeline remapped, else the RGBA16Float one.
+- (NmbRenderPipeline *)handleForXr:(uint32_t)passXr {
+ if(!(xrMask & passXr) || !xrDescriptor)return _handle;
+ @synchronized(self) {
+  if(!xrTried) {
+   xrTried=true;
+   const NmbPipelineOptions creation={0,nullptr,0};
+   const uint64_t began=nowUs();
+   xrHandle=nmb_render_pipeline_new_with_options(gDevice,xrDescriptor.get(),&creation);gTimePipeline.add(began);
+   if(xrHandle)gXrVariants++;else noteProblem([NSString stringWithFormat:@"render pipeline (XR variant): %s",nmb_last_error()]);
+  }
+ }
+ return xrHandle?:_handle;
+}
 // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
 - (NSUInteger)maxTotalThreadsPerThreadgroup {
  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))return 0;
@@ -1014,11 +1042,12 @@ static void noteSurfaceContents(NBTexture *texture) {
 @end
 
 @interface NBRenderEncoder : NBEncoder
+@property(nonatomic) uint32_t passXr;   // the pass's color attachments that keep a BGRA10_XR-family format (bit i)
 @end
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
- [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
+ [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handleForXr:_passXr]) what:"setRenderPipelineState"];
  if(self.capture)self.capture->pipeline=[(NBRenderPipeline *)state captureId];
  [self frameCommand:"{\"pipeline\":\"r"+std::to_string([(NBRenderPipeline *)state captureId])+"\"}"];
 }
@@ -1297,6 +1326,10 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
  NBRenderEncoder *encoder=[self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ if(encoder)for(unsigned i=0;i<8;i++) {
+  id<MTLTexture> t=d.colorAttachments[i].texture;
+  if([(id)t isKindOfClass:[NBTexture class]]) {const uint64_t f=[(NBTexture *)t descriptor].format;if(f>=550 && f<=555)encoder.passXr|=1u<<i;}
+ }
  if(encoder && encoder.frame) {
   FrameCb *cb=_frame.get();
   auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,const std::string &clear)->std::string {
@@ -1962,10 +1995,20 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
  const long captureNumber=pcap::render(p,[(NBFunction *)d.vertexFunction captureId],d.fragmentFunction?[(NBFunction *)d.fragmentFunction captureId]:std::string(),
                             d.label.UTF8String,d.alphaToCoverageEnabled,handle!=nullptr);
- delete p;
+ NmbRenderPipelineDescriptor *xp=p;   // kept for the XR variant below
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
- if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.captureId=captureNumber;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ if(!handle){delete xp;return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);}
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.captureId=captureNumber;gPipelines++;
+ for(unsigned i=0;i<8;i++) {
+  const uint64_t asked=(uint64_t)d.colorAttachments[i].pixelFormat;
+  if(xrFormat(asked)!=asked) {
+   if(!state->xrDescriptor)state->xrDescriptor=std::make_shared<NmbRenderPipelineDescriptor>(*xp);
+   state->xrDescriptor->colors[i].format=asked;state->xrMask|=1u<<i;
+  }
+ }
+ if(state->xrMask)state.xrFunctions=@[d.vertexFunction?:(id)[NSNull null],d.fragmentFunction?:(id)[NSNull null]];
+ delete xp;
+ if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
 }
 // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
 // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
@@ -2248,7 +2291,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
- row("N xr as f16: textures %llu pipelines %llu",(unsigned long long)gXrTextures.load(),(unsigned long long)gXrPipelines.load());
+ row("N xr as f16: textures %llu pipelines %llu xr variants %llu",(unsigned long long)gXrTextures.load(),(unsigned long long)gXrPipelines.load(),(unsigned long long)gXrVariants.load());
  row("N surface generations stated %llu",(unsigned long long)gSurfaceGenerations.load());
  row("N host copies %llu bytes %llu",(unsigned long long)gHostCopies.load(),(unsigned long long)gHostCopyBytes.load());
  row("N host remaps %llu ranges %llu",(unsigned long long)gHostRemaps.load(),(unsigned long long)[]{std::lock_guard<std::mutex> l(gHostRangeLock);return gHostRanges.size();}());
