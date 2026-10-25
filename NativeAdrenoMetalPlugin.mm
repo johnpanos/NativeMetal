@@ -221,6 +221,14 @@ static id deviceForPort(unsigned port) {
             fclose(f);
         }
         setenv("TU_DEBUG", tuDebug, 0);
+        // Render defaults measured on fajita (2026-10-25, ROUNDS=3 interleaved, 8-restart stress and tour clean): App Library motion
+        // 55.8 vs 48.8, home 54.8 vs 53.4. Encoder calls go to the encode worker 32 at a time; the bridge's thread cache allocator;
+        // a 64-byte linear texture alignment, so CoreAnimation's surfaces get rows Turnip renders in place, and the runtime renders
+        // into those padded surfaces (no copy-back). A gpu-env line below overrides each (=1 / =0 / =16 / =0).
+        setenv("NGPU_ENCODE_BATCH", "32", 0);
+        setenv("NMB_TCACHE", "1", 0);
+        setenv("NGPU_LINEAR_ALIGNMENT", "64", 0);
+        setenv("M2V_ALIAS_PADDED_TARGETS", "1", 0);
         // Diagnostics: each KEY=VALUE line of /private/var/ngpu/gpu-env is set for the Metal process before Turnip loads
         // (e.g. IR3_SHADER_DEBUG=disasm with MESA_SHADER_CACHE_DISABLE=true: every compiled shader's IR3 into the Mesa log).
         if (FILE *f = fopen("/private/var/ngpu/gpu-env", "r")) {
