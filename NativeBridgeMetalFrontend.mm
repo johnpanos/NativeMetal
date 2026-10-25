@@ -957,7 +957,7 @@ static void noteSurfaceContents(NBTexture *texture) {
   nmb_texture_set_contents_generation(t.handle,generation);
  gSurfaceGenerations++;
 }
-// A texture over a buffer's bytes whose generation the frontend can state (NGPU_CPU_HELD=0: none, every use copies in as before):
+// A texture over a buffer's bytes whose generation the frontend can state (NGPU_CPU_HELD=1; off by default: every use copies in):
 //  - a no-copy buffer's GPU-owned copy (NGPU_HOST_COPY's default, the bytes copied once at creation): only a writer through `contents`
 //    changes them, so its texture states a constant generation until the first `contents` call;
 //  - a no-copy import of the caller's pages (above 4 MiB: the wallpaper's images): the kernel says whether the CPU wrote them since the
@@ -967,7 +967,7 @@ static void noteSurfaceContents(NBTexture *texture) {
 static int (*gHostDirty)(const uint64_t *,uint32_t,uint32_t *);
 static std::string gLoaderPath;
 static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
- static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return !(v && v[0]=='0');}();
+ static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return v && v[0]=='1';}();   // opt-in until the correctness tour is clean
  NBBuffer *buffer=texture.buffer;
  if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
  if(buffer.copySource) {
