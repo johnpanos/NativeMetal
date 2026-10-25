@@ -511,7 +511,8 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         "supportsYCBCRPackedFormats12" => format_supported(PixelFormat::YCBCR124202PPACKED) as u64,
         "minimumLinearTextureAlignmentForPixelFormat:" => p
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
-            .map_err(e("minimum linear texture alignment"))?,
+            .map_err(e("minimum linear texture alignment"))?
+            .max(linear_alignment_floor()),
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
         "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
         "supportsRasterizationRateMapWithLayerCount:" => gap(p.supports_rasterization_rate_map_with_layer_count(arg))?,
@@ -542,6 +543,17 @@ pub unsafe extern "C" fn nmb_device_answer(device: *const NmbDevice, selector: *
     })
 }
 
+/// NGPU_LINEAR_ALIGNMENT=N (gpu-env, an A/B, default unset: Metal's 16): the linear texture alignment the device answers is at least N
+/// bytes, for `minimumLinearTextureAlignmentForPixelFormat:` and the row size below. CoreAnimation sizes its frame surfaces' rows from
+/// them (1125 px: 4512 bytes at 16), and Turnip makes a linear image over memory only at a 64-byte pitch, so at 16 the runtime renders
+/// those surfaces into an image of its own and copies it back (copy_image_to_buffer, 1.7 ms of GPU a frame on fajita).
+fn linear_alignment_floor() -> u64 {
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("NGPU_LINEAR_ALIGNMENT").ok().and_then(|v| v.parse::<u64>().ok()).filter(|v| v.is_power_of_two()).unwrap_or(0)
+    })
+}
+
 /// `requiredLinearTextureBytesPerRowForDescriptor:` (Apple SPI): a row of `width` texels of `format` rounded up to the format's
 /// linear alignment, from the runtime's format description; 0, with the reason, for a format no buffer can back.
 #[unsafe(no_mangle)]
@@ -551,7 +563,8 @@ pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, form
         let alignment = d
             .properties()
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(format, "pixel format")?)
-            .map_err(e("linear texture"))?;
+            .map_err(e("linear texture"))?
+            .max(linear_alignment_floor());
         let info = d.pixel_format_info(format);
         // Flags bit 0x400: a format of blocks, which the alignment query has refused already.
         if info.flags & 0x400 != 0 || info.words[0] == 0 {
