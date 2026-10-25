@@ -188,6 +188,14 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // NGPU_IDLE_COLORS=1 (gpu-env, an A/B, default off): a color attachment that loads and stores DontCare stays out of the
         // draws' subpass until a draw writes or fetches it, so Turnip's GMEM holds no tile memory for CoreAnimation's idle second
         // color (DevicePolicy::idle_colors).
+        // NGPU_COLOR_WRITES=exact / NGPU_EXTENDED_RANGE=exact (gpu-env, A/Bs): Metal's exact color-write rounding and extended-range
+        // arithmetic in the shaders instead of the device's (the translator's defaults since fc4e10e9 and b91baaa4/f372253f).
+        if std::env::var("NGPU_COLOR_WRITES").as_deref() == Ok("exact") {
+            options.policy.color_writes = metal2vulkan::device::ColorWritePolicy::Exact;
+        }
+        if std::env::var("NGPU_EXTENDED_RANGE").as_deref() == Ok("exact") {
+            options.policy.extended_range = metal2vulkan::device::ExtendedRangePolicy::Exact;
+        }
         if std::env::var("NGPU_IDLE_COLORS").as_deref() == Ok("1") {
             options.policy.idle_colors = metal2vulkan::device::IdleColorsPolicy::LeftOut;
         }
