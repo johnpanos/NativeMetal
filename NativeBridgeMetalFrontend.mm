@@ -964,7 +964,7 @@ static void noteSurfaceContents(NBTexture *texture) {
 //    last check (NativeAdreno HostDirty, through Turnip's tu_darwin_host_dirty), once per command buffer, and a write moves the generation.
 // The runtime then copies the texture's bytes into its shadow image only when they changed (fajita shadow log: 1271x1823 and 1326x1326
 // textures over the wallpaper's pages copied in at every use, 19 GB in 86 s; 180x180 icons and labels over copies, about 50,000).
-static int (*gHostDirty)(const uint64_t *,uint32_t,uint32_t *);
+static int (*gHostDirty)(const uint64_t *,uint32_t,uint32_t *,uint32_t *);
 static std::string gLoaderPath;
 static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
  static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return v && v[0]=='1';}();   // opt-in until the correctness tour is clean
@@ -982,7 +982,7 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
  static dispatch_once_t once;
  dispatch_once(&once,^{
   if(void *lib=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOLOAD|RTLD_LAZY))
-   gHostDirty=(int (*)(const uint64_t *,uint32_t,uint32_t *))dlsym(lib,"tu_darwin_host_dirty");
+   gHostDirty=(int (*)(const uint64_t *,uint32_t,uint32_t *,uint32_t *))dlsym(lib,"tu_darwin_host_dirty");
  });
  if(!gHostDirty) {
   static std::atomic<bool> said{false};
@@ -992,12 +992,15 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
  texture.cpuCheckedIn=commands->serial;
  const NmbTextureDescriptor &d=texture.descriptor;
  const uint64_t range[2]={(uint64_t)(uintptr_t)buffer.wrapped+texture.offset,(uint64_t)texture.rowBytes*(d.height?d.height:1)};
- uint32_t dirty=~0u;
- if(const int kr=gHostDirty(range,1,&dirty)) {   // an older kernel: no statement
+ uint32_t dirty=~0u,stats[4]={};
+ if(const int kr=gHostDirty(range,1,&dirty,stats)) {   // an older kernel: no statement
   static std::atomic<int> said{0};
   if(said++<4){char line[160];snprintf(line,sizeof line,"P host dirty: error %x for %llx+%llx",kr,(unsigned long long)range[0],(unsigned long long)range[1]);journal(line);}
   return;
  }
+ {static std::atomic<int> said{0};
+  if(said++<12){char line[200];snprintf(line,sizeof line,"P host dirty: %llx+%llx dirty %u pages %u uncovered %u unmapped %u modified %u",
+   (unsigned long long)range[0],(unsigned long long)range[1],dirty&1,stats[0],stats[1],stats[2],stats[3]);journal(line);}}
  if((dirty&1) || !texture.cpuGeneration)texture.cpuGeneration++;
  nmb_texture_set_contents_generation(texture.handle,texture.cpuGeneration);
 }
