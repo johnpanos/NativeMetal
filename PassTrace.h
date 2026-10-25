@@ -5,6 +5,7 @@
 // GPU time to the pass's key. Turnip's CSV never reaches the file system, so its size and the u_trace caveat of NOTES-gpu-userland.md
 // (every Metal process writing one growing file) do not apply.
 //   key   render passes: rp WxH aN clC/ldL/stS gmem|sysmem (attachment size, count, the clear/load/store bytes per pixel Turnip states), the draw-count bucket;
+//         draws (only with TU_GPU_TRACEPOINT=+draw in gpu-env; each draw then writes two timestamps): draw fs=<blake3> vs=<blake3>;
 //         nested pass steps (sysmem_clear, gmem_load, ...) and transfers (copy_buffer_to_image, blit, ...): their kind and the size the
 //         event states; compute: cs and its group counts
 // Every second while passes arrive, the summary is rewritten (tmp + rename) as <cache>/frametrace/<progname>-passes.csv (a fixed name,
@@ -66,6 +67,8 @@ inline std::string keyFor(const std::string &kind,const char *args) {
   for(const char *f:{"num_groups_x","num_groups_y","num_groups_z"}){std::string v=arg(args,f);if(!v.empty())k+=" "+v;}
   return k;
  }
+ if(kind=="draw")  // TU_GPU_TRACEPOINT=+draw: per draw, by its shaders (ir3's binary blake3, as IR3_SHADER_DEBUG's "Native code" lines say)
+  return "draw fs="+arg(args,"fs_sha1").substr(0,16)+" vs="+arg(args,"vs_sha1").substr(0,16);
  std::string k=kind;
  std::string w=arg(args,"width"),h=arg(args,"height");
  if(!w.empty())k+=" "+w+"x"+h;
