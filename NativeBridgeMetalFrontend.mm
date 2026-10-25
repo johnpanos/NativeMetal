@@ -13,6 +13,7 @@
 #include "TargetBuild.h"
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <pthread.h>
 #include <string>
@@ -949,15 +950,43 @@ static bool asyncEncode() {
  }();
  return on;
 }
-static std::atomic<uint64_t> gEncodeDeferred,gEncodeDrains;
+static std::atomic<uint64_t> gEncodeDeferred,gEncodeDrains,gEncodeBatches;
+// NGPU_ENCODE_BATCH=N (gpu-env, an A/B, default 1: one dispatch a call): the calls go to the worker N at a time, in call order, as
+// one dispatch_async each batch, instead of one dispatch (a continuation, and a worker wakeup when it is idle) per call. Pending
+// calls go at once at every commit (the worker's commit releases gEncodeAhead), at every drain, and at the end of an encoder.
+static unsigned encodeBatch() {
+ static const unsigned n=[]{const char *v=getenv("NGPU_ENCODE_BATCH");const int k=v?atoi(v):1;return (unsigned)(k<1?1:k>256?256:k);}();
+ return n;
+}
+static std::mutex gEncodeLock;
+static std::vector<dispatch_block_t> gEncodePending;
+static void encodeFlushLocked() {
+ if(gEncodePending.empty())return;
+ auto batch=std::make_shared<std::vector<dispatch_block_t>>();
+ batch->swap(gEncodePending);
+ gEncodePending.reserve(encodeBatch());
+ gEncodeBatches++;
+ dispatch_async(gEncodeQueue,^{if(cpuprof::on())cpuprof::note();for(dispatch_block_t b:*batch)b();});
+}
+static void encodeFlush() {
+ if(!asyncEncode() || encodeBatch()==1)return;
+ std::lock_guard<std::mutex> lock(gEncodeLock);encodeFlushLocked();
+}
 static void encodeRun(void (^block)(void)) {
  // The CPU profile samples the worker's threads too (the translation of each command buffer runs there): a serial queue's blocks run
  // on whichever pool thread GCD picks, each registered once (cpuprof::note is per thread).
- if(asyncEncode()){gEncodeDeferred++;if(cpuprof::on())dispatch_async(gEncodeQueue,^{cpuprof::note();block();});else dispatch_async(gEncodeQueue,block);}
- else block();
+ if(!asyncEncode()){block();return;}
+ gEncodeDeferred++;
+ if(encodeBatch()>1) {
+  std::lock_guard<std::mutex> lock(gEncodeLock);
+  gEncodePending.push_back(block);
+  if(gEncodePending.size()>=encodeBatch())encodeFlushLocked();
+  return;
+ }
+ if(cpuprof::on())dispatch_async(gEncodeQueue,^{cpuprof::note();block();});else dispatch_async(gEncodeQueue,block);
 }
 static void encodeDrain() {
- if(asyncEncode()){gEncodeDrains++;dispatch_sync(gEncodeQueue,^{});}
+ if(asyncEncode()){encodeFlush();gEncodeDrains++;dispatch_sync(gEncodeQueue,^{});}
 }
 #define NB_ENC(...) encodeRun(^{ __VA_ARGS__; })
 static void waitForResource(id resource) {
@@ -1097,6 +1126,7 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
  if(_ended){[_commandBuffer refuse:@"endEncoding twice"];return;}
  _ended=YES;
  NB_ENC(NmbEncoder *handle=self.handle;self.handle=nullptr;if(handle)[self check:nmb_encoder_end(handle) what:"endEncoding"]);
+ encodeFlush();   // the worker starts on a pass once it is encoded (NGPU_ENCODE_BATCH)
  if(_frame && _commandBuffer.frame) {
   std::string s="{\""+_frame->kind+"\":{"+_frame->head+(_frame->head.empty()?"":",")+"\"commands\":[";
   for(size_t i=0;i<_frame->commands.size();i++)s+=(i?",":"")+_frame->commands[i];
@@ -1632,6 +1662,7 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
   [self commitRuntime:surfaces];
   if(asyncEncode())dispatch_semaphore_signal(gEncodeAhead);
  });
+ encodeFlush();
 }
 - (void)commitRuntime:(NSMutableSet *)surfaces {
  if(!self.encodeFailure) {
