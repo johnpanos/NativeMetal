@@ -419,8 +419,17 @@ static void flushSurfaces(NSMutableSet *surfaces) {
   gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
  }
 }
+// NGPU_TEXTURE_LOG=1 (gpu-env, diagnostics): a "T" journal line (pipelines.log) per texture over a heap's or a buffer's bytes, with its
+// size, format, usage, the bytes' storage mode and row pitch: what M2V_SHADOW_LOG's shadows (logged by extent) are.
+static void noteTextureMade(const char *kind,MTLTextureDescriptor *d,unsigned long storage,unsigned long row) {
+ static const bool on=[]{const char *v=getenv("NGPU_TEXTURE_LOG");return v && v[0]=='1';}();
+ if(!on || !d)return;
+ char line[160];snprintf(line,sizeof line,"T %s %lux%lu format %lu usage %lx storage %lu row %lu",kind,(unsigned long)d.width,(unsigned long)d.height,
+  (unsigned long)d.pixelFormat,(unsigned long)d.usage,storage,row);journal(line);
+}
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+ noteTextureMade(surface?"surface":"buffer",d,(unsigned long)((buffer.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift),row);
  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
  if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
@@ -934,7 +943,12 @@ static std::atomic<uint64_t> gSurfaceGenerations;
 static void noteSurfaceContents(NBTexture *texture) {
  static const bool on=[]{const char *v=getenv("NGPU_YCBCR_SEED");return !(v && v[0]=='0');}();
  if(!on || !texture.surface)return;
- nmb_texture_set_contents_generation(texture.handle,(uint64_t)IOSurfaceGetSeed(texture.surface)+1);gSurfaceGenerations++;
+ // A view states its parents' too: a view of another component layout is a shadow of its parent's image, and the copy in from the
+ // surface's bytes is the parent's (fajita shadow log: 1271x1823 and 1326x1326 surfaces copied in at every use, never stated).
+ const uint64_t generation=(uint64_t)IOSurfaceGetSeed(texture.surface)+1;
+ for(NBTexture *t=texture;t;t=[t.parent isKindOfClass:[NBTexture class]]?(NBTexture *)t.parent:nil)
+  nmb_texture_set_contents_generation(t.handle,generation);
+ gSurfaceGenerations++;
 }
 @implementation NBEncoder
 - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
@@ -1719,6 +1733,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
 - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  if(xrFormat(descriptor.format)!=descriptor.format){descriptor.format=xrFormat(descriptor.format);gXrTextures++;}
+ noteTextureMade("heap",d,(unsigned long)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift),0);
  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
  if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
