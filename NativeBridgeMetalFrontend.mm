@@ -153,6 +153,7 @@ static void waitForResource(id resource);
 // NGPU_HOST_COPY=1: a no-copy buffer stood in by a GPU-owned copy of the caller's bytes, refreshed at every commit; the caller's
 // deallocator runs when the buffer goes.
 @property(nonatomic) void *copySource;
+@property(atomic) BOOL contentsTouched;   // contents was asked for: the CPU may write the bytes the runtime holds
 @property(nonatomic) NSUInteger copyBytes;
 @property(nonatomic,copy) void (^copyDeallocator)(void *,NSUInteger);
 @end
@@ -166,6 +167,7 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 - (id<MTLTexture>)view:(NmbTexture *)handle;
+@property(nonatomic) uint64_t cpuGeneration,cpuCheckedIn;   // CPU-written texture over a buffer: its stated generation, last command buffer checked
 @end
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
@@ -188,7 +190,7 @@ static std::atomic<int64_t> gLiveBuffers,gLiveCopies,gLiveTextures;
  if(_copyDeallocator)_copyDeallocator(_copySource,_copyBytes);
 }
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
-- (void *)contents {return nmb_buffer_contents(_handle);}
+- (void *)contents {_contentsTouched=YES;return nmb_buffer_contents(_handle);}
 - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
 - (MTLResourceOptions)resourceOptions {return _options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
@@ -713,6 +715,7 @@ static void notified(void *context,uint64_t value) {
 @end
 @interface NBCommandBuffer : NBObject {
 @public
+ uint64_t serial;   // nonzero, unique: a texture over CPU-written bytes is checked once per command buffer (noteCpuContents)
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
  bool cpuOpen;  // counted open in the CPU profile (CpuProfile.h)
@@ -954,6 +957,41 @@ static void noteSurfaceContents(NBTexture *texture) {
   nmb_texture_set_contents_generation(t.handle,generation);
  gSurfaceGenerations++;
 }
+// A texture over a buffer's bytes whose generation the frontend can state (NGPU_CPU_HELD=0: none, every use copies in as before):
+//  - a no-copy buffer's GPU-owned copy (NGPU_HOST_COPY's default, the bytes copied once at creation): only a writer through `contents`
+//    changes them, so its texture states a constant generation until the first `contents` call;
+//  - a no-copy import of the caller's pages (above 4 MiB: the wallpaper's images): the kernel says whether the CPU wrote them since the
+//    last check (NativeAdreno HostDirty, through Turnip's tu_darwin_host_dirty), once per command buffer, and a write moves the generation.
+// The runtime then copies the texture's bytes into its shadow image only when they changed (fajita shadow log: 1271x1823 and 1326x1326
+// textures over the wallpaper's pages copied in at every use, 19 GB in 86 s; 180x180 icons and labels over copies, about 50,000).
+static int (*gHostDirty)(const uint64_t *,uint32_t,uint32_t *);
+static std::string gLoaderPath;
+static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
+ static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return !(v && v[0]=='0');}();
+ NBBuffer *buffer=texture.buffer;
+ if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
+ if(buffer.copySource) {
+  if(buffer.contentsTouched)return;
+  static const bool everyCommit=[]{const char *v=getenv("NGPU_HOST_COPY");return v && v[0]=='2';}();
+  if(everyCommit)return;
+  if(!texture.cpuGeneration){texture.cpuGeneration=1;nmb_texture_set_contents_generation(texture.handle,1);}
+  return;
+ }
+ if(!buffer.wrapped || texture.cpuCheckedIn==commands->serial)return;
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  if(void *lib=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOLOAD|RTLD_LAZY))
+   gHostDirty=(int (*)(const uint64_t *,uint32_t,uint32_t *))dlsym(lib,"tu_darwin_host_dirty");
+ });
+ if(!gHostDirty)return;
+ texture.cpuCheckedIn=commands->serial;
+ const NmbTextureDescriptor &d=texture.descriptor;
+ const uint64_t range[2]={(uint64_t)(uintptr_t)buffer.wrapped+texture.offset,(uint64_t)texture.rowBytes*(d.height?d.height:1)};
+ uint32_t dirty=~0u;
+ if(gHostDirty(range,1,&dirty)!=0)return;   // an older kernel: no statement
+ if((dirty&1) || !texture.cpuGeneration)texture.cpuGeneration++;
+ nmb_texture_set_contents_generation(texture.handle,texture.cpuGeneration);
+}
 @implementation NBEncoder
 - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
 - (bool)check:(bool)ok what:(const char *)what {
@@ -993,6 +1031,7 @@ static void noteSurfaceContents(NBTexture *texture) {
   [_commandBuffer.surfaces addObject:texture];
   noteSurfaceContents((NBTexture *)texture);
  }
+ if(texture)noteCpuContents((NBTexture *)texture,_commandBuffer);
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
  if(_frame && texture)_frame->commands.push_back(std::string("{\"texture\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"texture\":\""+
      fcap::texture((NBTexture *)texture,true,_commandBuffer.frame.get())+"\"}}");
@@ -1547,6 +1586,7 @@ static void completed(void *context) {
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
  NBCommandBuffer *commandBuffer=[NBCommandBuffer new];commandBuffer.handle=handle;commandBuffer.queue=self;
+ {static std::atomic<uint64_t> serials{0};commandBuffer->serial=++serials;}
  if(const long frame=fcap::begin();frame>=0){auto record=std::make_shared<FrameCb>();record->index=frame;commandBuffer.frame=record;}
  return (id<MTLCommandBuffer>)commandBuffer;
 }
@@ -2175,6 +2215,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  passtrace::arm(cache);cpuprof::arm(cache);  // before the device opens: Turnip reads its u_trace settings once (PassTrace.h)
  gDevice=nmb_device_open(loader,cache);
+ if(loader)gLoaderPath=loader;
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  pcap::begin(cache);if(pcap::on())journal("X capture "+pcap::dir());
