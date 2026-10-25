@@ -117,9 +117,9 @@ static void serveScanout(Gpu &gpu, id device) {
                 return g.map(g.conn, 0x5343, mach_task_self(), address, length, 0x101);   // anywhere + inhibit cache
             },
             [](void *c, uint32_t value) {static_cast<ScanoutContext *>(c)->marker->mark(value);},
-            [](void *c, uint64_t *address, uint64_t *length) -> int {
+            [](void *c, unsigned index, uint64_t *address, uint64_t *length) -> int {
                 Gpu &g = static_cast<ScanoutContext *>(c)->link;
-                return g.map(g.conn, 0x5344, mach_task_self(), address, length, 0x101);   // the back buffer (fajita-fb-flip=1)
+                return g.map(g.conn, 0x5343 + index, mach_task_self(), address, length, 0x101);   // 0x5344 back, 0x5345 third (fajita-fb-flip=1)
             }};
         gpuscanout::Client client;
         const bool opened = client.open((id<MTLDevice>)device, transport, &st);

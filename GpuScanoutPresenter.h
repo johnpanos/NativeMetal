@@ -35,7 +35,7 @@ struct Frame {
     size_t stride;
     uint32_t width, height;
     uint32_t mapId;   // NGPSwap.reserved: nonzero when the kernel keeps this mapping across swaps, so its import can be kept too
-    unsigned target = 0;   // NGPSwap.target: 0 the scanout, 1 the back buffer (double-buffered scan-out)
+    unsigned target = 0;   // NGPSwap.target: 0 the scanout, 1 the back buffer, 2 the third (double- or triple-buffered scan-out)
     bool flip = false;     // NGPSwap.flags bit 0: the display flips to the target, so the copy completes before the swap does
 };
 
@@ -43,14 +43,18 @@ enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
 
 class Presenter {
 public:
-    // `back`: the double-buffered scan-out's second buffer, the same size and layout as the scanout (null: one buffer).
-    Presenter(id<MTLDevice> device, const Scanout &scanout, const void *back = nullptr) : device_(device), scanout_(scanout) {
+    // `back`, `third`: the flipped scan-out's other buffers, the same size and layout as the scanout (null: not there).
+    Presenter(id<MTLDevice> device, const Scanout &scanout, const void *back = nullptr, const void *third = nullptr)
+        : device_(device), scanout_(scanout) {
         queue_ = [device newCommandQueue];
         queue_.label = @"ngpu.present";
         if (!validScanout() || !queue_) return;
         targets_[0] = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (back && !((uintptr_t)back & (getpagesize() - 1)))
-            targets_[1] = [device newBufferWithBytesNoCopy:(void *)back length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        const void *more[2] = {back, third};
+        for (unsigned i = 0; i < 2; ++i)
+            if (more[i] && !((uintptr_t)more[i] & (getpagesize() - 1)))
+                targets_[i + 1] = [device newBufferWithBytesNoCopy:(void *)more[i] length:scanout.bytes options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
         target_ = targets_[0];
     }
     bool doubleBuffered() const { return targets_[1] != nil; }
@@ -60,7 +64,7 @@ public:
     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
     Result present(const Frame &frame) {
         if (!ready()) return kBadScanout;
-        if (frame.target > 1 || !targets_[frame.target]) return kBadScanout;
+        if (frame.target > 2 || !targets_[frame.target]) return kBadScanout;
         target_ = targets_[frame.target];
         letterboxed_ = letterboxedAt_[frame.target];
         const Result r = presentTo(frame);
@@ -271,8 +275,8 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
-    id<MTLBuffer> targets_[2] = {nil, nil};
-    bool letterboxedAt_[2] = {false, false};
+    id<MTLBuffer> targets_[3] = {nil, nil, nil};
+    bool letterboxedAt_[3] = {false, false, false};
     id<MTLComputePipelineState> pipeline_ = nil, pipeline4_ = nil, pipeline4v_ = nil;
     bool span2_ = false;
     id<MTLBuffer> taps_ = nil;

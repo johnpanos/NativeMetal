@@ -28,8 +28,8 @@ struct Transport {
     int (*mapScanout)(void *context, uint64_t *address, uint64_t *length);
     // Progress marker (the plugin shows the latest ones on the boot page, which survives a panic that parks the calling core).
     void (*mark)(void *context, uint32_t value);
-    // The double-buffered scan-out's back buffer, writable, mapped into this task (null, or nonzero: one buffer).
-    int (*mapBack)(void *context, uint64_t *address, uint64_t *length);
+    // The flipped scan-out's other buffers (index 1 the back buffer, 2 the third), writable, mapped into this task (null, or nonzero: absent).
+    int (*mapBack)(void *context, unsigned index, uint64_t *address, uint64_t *length);
 };
 
 struct Stats {
@@ -69,9 +69,10 @@ public:
         note(0x6714);
         scanout_ = scanout;
         // The back buffer, where the kernel flips (fajita-fb-flip=1); without it every frame goes to the one scanout.
-        uint64_t back = 0, backLength = 0;
-        if (transport_.mapBack && (transport_.mapBack(transport_.context, &back, &backLength) || backLength < mode.bytes)) back = 0;
-        presenter_ = new gpupresent::Presenter(device, scanout, (const void *)(uintptr_t)back);
+        uint64_t more[3] = {}, lengths[3] = {};
+        for (unsigned i = 1; i < 3 && transport_.mapBack; ++i)
+            if (transport_.mapBack(transport_.context, i, &more[i], &lengths[i]) || lengths[i] < mode.bytes) more[i] = 0;
+        presenter_ = new gpupresent::Presenter(device, scanout, (const void *)(uintptr_t)more[1], (const void *)(uintptr_t)more[2]);
         note(0x6715);
         if (!presenter_->ready()) return fail(3, 0);
         stats_->step = 4;
