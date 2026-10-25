@@ -958,8 +958,10 @@ static void noteSurfaceContents(NBTexture *texture) {
  // A view states its parents' too: a view of another component layout is a shadow of its parent's image, and the copy in from the
  // surface's bytes is the parent's (fajita shadow log: 1271x1823 and 1326x1326 surfaces copied in at every use, never stated).
  const uint64_t generation=(uint64_t)IOSurfaceGetSeed(texture.surface)+1;
+ // Only the root: a view's own shadow (another component layout) is copied from its parent's image, which a later copy in from the
+ // bytes refreshes without the view's statement moving, so a stated view could keep what it copied before (fajita: garbage icons).
  for(NBTexture *t=texture;t;t=[t.parent isKindOfClass:[NBTexture class]]?(NBTexture *)t.parent:nil)
-  nmb_texture_set_contents_generation(t.handle,generation);
+  if(!t.parent)nmb_texture_set_contents_generation(t.handle,generation);
  gSurfaceGenerations++;
 }
 // A texture over a buffer's bytes whose generation the frontend can state (NGPU_CPU_HELD=1; off by default: every use copies in):
@@ -975,6 +977,7 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
  static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return v && (v[0]=='1' || v[0]=='2');}();   // opt-in until the correctness tour is clean
  NBBuffer *buffer=texture.buffer;
  if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
+ if(texture.parent)return;   // a view: its own shadow follows its parent's image, never a statement (noteSurfaceContents)
  if(buffer.copySource) {
   // Once its contents was asked for, the CPU may write it unseen: no generation (every use copies in again).
   if(buffer.contentsTouched){if(texture.cpuGeneration){texture.cpuGeneration=0;nmb_texture_set_contents_generation(texture.handle,0);}return;}
