@@ -1678,8 +1678,23 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
   (unsigned long long)tracePipeUs,(unsigned long long)tracePipeN,(unsigned long long)traceWaitUs,(unsigned long long)traceFlushUs,
   (unsigned long long)(traceFlushBytes>>10),ftrace::field((self.label?:_queue.label).UTF8String).c_str());
 }
+// NGPU_SCHEDULED_EARLY=1 (gpu-env, an A/B, default off; the render server only): under async encode, waitUntilScheduled returns
+// once the commit is queued on the encode worker instead of after the worker submitted it. CoreAnimation's commitAndWaitUntilSubmitted
+// otherwise waits out the worker's translation of the frame (about 10 ms on fajita), serially with its own work. The swap's consumer,
+// the scanout presenter, encodes and commits through this frontend on the same serial worker, so its copy is still submitted after the
+// frame. Other processes hand their surfaces across processes and keep the full wait.
+static bool scheduledEarly() {
+ static const bool on=[]{
+  const char *v=getenv("NGPU_SCHEDULED_EARLY");
+  const char *name=getprogname();
+  return asyncEncode() && v && v[0]=='1' && name && !strcmp(name,"backboardd");
+ }();
+ return on;
+}
+static std::atomic<uint64_t> gScheduledEarly;
 - (void)waitUntilScheduled {
  if(!self.committed)return;
+ if(scheduledEarly() && !self.failedLocally){gScheduledEarly++;return;}
  encodeDrain();
  const uint64_t began=nowUs();
  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
