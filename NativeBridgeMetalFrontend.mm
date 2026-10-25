@@ -929,7 +929,7 @@ static const char *stageName(uint32_t stage) {return stage==1?"vertex":stage==2?
 static std::string num(double v) {char e[40];snprintf(e,sizeof e,"%.9g",v);return e;}
 static std::string triple(uint64_t a,uint64_t b,uint64_t c) {return "["+std::to_string(a)+","+std::to_string(b)+","+std::to_string(c)+"]";}
 }  // namespace fcap
-// NGPU_ASYNC_ENCODE=1: the runtime's side of encoding (every nmb_ call an encoder or a command buffer makes, and commit) runs on one serial
+// NGPU_ASYNC_ENCODE (default on; =0 off): the runtime's side of encoding (every nmb_ call an encoder or a command buffer makes, and commit) runs on one serial
 // worker thread, in call order, so the translator's per-draw work overlaps the render server's own work between draws and frames on
 // another core (fajita: encode 14 ms + the render server 8 ms, serial on its render thread, made the frame). The frontend's own
 // bookkeeping (counters, surfaces, generations, captures) stays on the caller's thread. Anything that observes the runtime's result
@@ -940,7 +940,7 @@ static dispatch_semaphore_t gEncodeAhead;
 static bool asyncEncode() {
  static const bool on=[]{
   const char *v=getenv("NGPU_ASYNC_ENCODE");
-  if(!(v && v[0]=='1'))return false;
+  if(v && v[0]=='0')return false;   // on by default (tour clean 2026-10-25); NGPU_ASYNC_ENCODE=0 encodes on the caller's thread
   dispatch_queue_attr_t attr=dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INTERACTIVE,0);
   gEncodeQueue=dispatch_queue_create("ngpu.encode",attr);
   gEncodeAhead=dispatch_semaphore_create(3);
