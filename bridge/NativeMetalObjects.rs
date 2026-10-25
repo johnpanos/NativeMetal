@@ -737,7 +737,14 @@ pub extern "C" fn nmb_heap_new_texture(heap: *const NmbHeap, descriptor: *const 
         let heap = &get(heap)?.0;
         let descriptor = texture_descriptor(descriptor)?;
         let texture = if offset == u64::MAX { heap.new_texture(&descriptor) } else { heap.new_texture_at_offset(&descriptor, offset) };
-        Ok(boxed(NmbTexture(texture.map_err(e("heap texture"))?)))
+        let texture = texture.map_err(e("heap texture"))?;
+        // A private heap's bytes change only through commands the runtime records, whose writes forget a shadow's held contents
+        // (shadow.rs StatedShadows): a constant generation lets an encoder skip the copy in of a heap texture's shadow that still
+        // holds them (fajita: CoreAnimation's heap textures were copied in at every use). NGPU_HEAP_HELD=0 keeps every copy.
+        if texture.storage_mode() == metal2vulkan_runtime::StorageMode::Private && std::env::var("NGPU_HEAP_HELD").as_deref() != Ok("0") {
+            texture.set_contents_generation(1);
+        }
+        Ok(boxed(NmbTexture(texture)))
     })
 }
 

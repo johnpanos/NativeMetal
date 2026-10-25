@@ -1184,7 +1184,7 @@ static void noteSurfaceContents(NBTexture *texture) {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer.resourceOwners addObject:o];
-  if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
+  if([(NBTexture *)o surface]){[self.commandBuffer.surfaces addObject:o];noteSurfaceContents((NBTexture *)o);}
  }
  return true;
 }
@@ -1318,7 +1318,7 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];noteSurfaceContents(texture);}
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
