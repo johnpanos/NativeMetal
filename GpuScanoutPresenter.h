@@ -12,6 +12,7 @@
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -52,6 +53,12 @@ public:
     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
     Result present(const Frame &frame) {
         if (!ready()) return kBadScanout;
+        // An experiment (NGPU_PRESENT_SKIP_FILE=1 in gpu-env, off by default): while the file /private/var/ngpu/present-skip exists, a
+        // frame is handed back without its copy (the screen keeps its old contents), to measure the frame rate without the presenter. An
+        // empty file turns it off again.
+        static const bool skipFile = [] { const char *v = getenv("NGPU_PRESENT_SKIP_FILE"); return v && v[0] == '1'; }();
+        struct stat st;
+        if (skipFile && stat("/private/var/ngpu/present-skip", &st) == 0 && st.st_size > 0) return kOk;
         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
             !frame.width || !frame.height || frame.stride < row || (frame.stride & 3) ||
