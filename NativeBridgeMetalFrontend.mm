@@ -154,6 +154,7 @@ static void waitForResource(id resource);
 // deallocator runs when the buffer goes.
 @property(nonatomic) void *copySource;
 @property(atomic) BOOL contentsTouched;   // contents was asked for: the CPU may write the bytes the runtime holds
+@property(atomic) uint64_t writeGeneration;   // replaceRegion calls on textures over the bytes (noteCpuContents)
 @property(nonatomic) NSUInteger copyBytes;
 @property(nonatomic,copy) void (^copyDeallocator)(void *,NSUInteger);
 @end
@@ -390,6 +391,8 @@ NB_RESOURCE_SPI
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+ // Every texture over the same bytes sees the write: their stated generations move (noteCpuContents).
+ if(_buffer)_buffer.writeGeneration=_buffer.writeGeneration+1;
  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
@@ -975,7 +978,9 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
   if(buffer.contentsTouched){if(texture.cpuGeneration){texture.cpuGeneration=0;nmb_texture_set_contents_generation(texture.handle,0);}return;}
   static const bool everyCommit=[]{const char *v=getenv("NGPU_HOST_COPY");return v && v[0]=='2';}();
   if(everyCommit)return;
-  if(!texture.cpuGeneration){texture.cpuGeneration=1;nmb_texture_set_contents_generation(texture.handle,1);}
+  // replaceRegion on any texture over the bytes moves the generation of every texture over them.
+  const uint64_t generation=1+buffer.writeGeneration;
+  if(texture.cpuGeneration!=generation){texture.cpuGeneration=generation;nmb_texture_set_contents_generation(texture.handle,generation);}
   return;
  }
  if(!buffer.wrapped || texture.cpuCheckedIn==commands->serial)return;
