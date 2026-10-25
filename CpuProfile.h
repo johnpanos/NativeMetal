@@ -7,11 +7,10 @@
 // Nothing is symbolized while a thread is stopped (dladdr takes dyld's lock); the summary does it afterwards, per distinct address.
 // Each sample is tagged "enc" when a command buffer is open on any registered thread (made, not yet committed: the frame trace's
 // encode window), "idle" when the thread is blocked in the kernel (pc in a mach trap / the kernel's wait: libsystem_kernel), else "cpu".
-// Every 2 s the summary is rewritten (tmp + rename) as <cache>/frametrace/<progname>-cpuprof.txt:
-//   # cpuprof v1 PROG pid PID samples N enc E cpu C idle I period US
-//   self:  the top 80 functions by samples where the thread was (image`symbol, enc/cpu counts)
-//   incl:  the top 80 functions by samples with the function anywhere on the stack
-//   stack: the top 40 stacks of 6 frames (enc + cpu samples)
+// Every 2 s the summary is rewritten (tmp + rename) as <cache>/frametrace/<progname>-cpuprof.txt: every distinct stack once with its
+// counts (enc: running while a command buffer is open on a registered thread; cpu: running, none open; blocked_enc / blocked_other: in
+// the kernel, with / without one open), innermost frame first.
+// tools/gpu/cpuprof.py (fajita board) symbolizes the plugin's frames and ranks self / inclusive / blocked time.
 // A file cpuprof-reset in the same directory clears it at the next summary and is removed (scripts/fajita/test/passtrace.sh reset does).
 #ifndef NATIVE_METAL_CPU_PROFILE_H
 #define NATIVE_METAL_CPU_PROFILE_H
@@ -35,7 +34,7 @@
 namespace cpuprof {
 constexpr int kDepth = 24;
 struct Thread {thread_act_t port;uintptr_t lo,hi;};
-struct Sample {uintptr_t pc[kDepth];int n;int tag;};  // tag 0 enc, 1 cpu, 2 idle
+struct Sample {uintptr_t pc[kDepth];int n;int tag;int thread;};  // tag 0 enc, 1 cpu, 2 idle
 inline bool &armed() {static bool on=false;return on;}
 inline bool on() {return __builtin_expect(armed(),0);}
 inline std::atomic<int> &open() {static std::atomic<int> n{0};return n;}
@@ -60,6 +59,9 @@ inline void opened() {if(on())open().fetch_add(1,std::memory_order_relaxed);}
 inline void closed() {if(on())open().fetch_sub(1,std::memory_order_relaxed);}
 
 struct Sym {std::string name;bool kernel;};
+// A frame as the summary writes it: image`symbol for the system's libraries (dladdr; the shared cache's locals read <redacted>), and
+// image+0xOFFSET for the plugin's own images (NativeAdrenoMetal, libvulkan_freedreno), which are stripped of local symbols on the
+// device: tools/gpu/cpuprof.py resolves those offsets against the unstripped copies the build keeps.
 inline const Sym &symbol(std::unordered_map<uintptr_t,Sym> &cache,uintptr_t pc) {
  auto it=cache.find(pc);
  if(it!=cache.end())return it->second;
@@ -68,7 +70,9 @@ inline const Sym &symbol(std::unordered_map<uintptr_t,Sym> &cache,uintptr_t pc) 
  if(dladdr((void *)pc,&info)&&info.dli_fname){
   const char *img=strrchr(info.dli_fname,'/');img=img?img+1:info.dli_fname;
   s.kernel=!strcmp(img,"libsystem_kernel.dylib");
-  s.name=std::string(img)+"`"+(info.dli_sname?info.dli_sname:"?");
+  if(strstr(info.dli_fname,"NativeAdrenoMetal.bundle")||strstr(img,"freedreno")){
+   char b[160];snprintf(b,sizeof b,"%s+0x%lx",img,(unsigned long)(pc-(uintptr_t)info.dli_fbase));s.name=b;
+  } else s.name=std::string(img)+"`"+(info.dli_sname?info.dli_sname:"?");
  } else {char b[32];snprintf(b,sizeof b,"0x%lx",(unsigned long)pc);s.name=b;s.kernel=false;}
  return cache.emplace(pc,s).first->second;
 }
@@ -78,61 +82,40 @@ inline void *sampler(void *) {
  const useconds_t period=pv?(useconds_t)atoi(pv):1000;
  std::vector<Sample> samples;samples.reserve(1<<16);
  std::unordered_map<uintptr_t,Sym> syms;
- uint64_t last=0,total=0,counts[3]={0,0,0};
+ uint64_t last=0,counts[3]={0,0,0};
  auto summary=[&]{
   std::string flag=dir()+"/cpuprof-reset";
-  if(access(flag.c_str(),F_OK)==0){unlink(flag.c_str());samples.clear();total=0;counts[0]=counts[1]=counts[2]=0;}
-  std::map<std::string,uint64_t[2]> self,incl;std::map<std::string,uint64_t> stacks;
+  if(access(flag.c_str(),F_OK)==0){unlink(flag.c_str());samples.clear();counts[0]=counts[1]=counts[2]=0;}
+  // Each distinct stack once, with its sample counts: enc (a command buffer open), cpu (none open), blocked (in the kernel), innermost first.
+  std::unordered_map<std::string,uint64_t[4]> stacks;
+  uint64_t blocked=0;
   for(Sample &s:samples){
    if(s.n==0)continue;
-   const Sym &top=symbol(syms,s.pc[0]);
-   int tag=s.tag;
-   if(top.kernel)tag=2;
-   if(tag==2){continue;}
-   self[top.name][tag]++;
-   std::vector<std::string> seen;
-   std::string st;
-   for(int i=0;i<s.n;++i){
-    const Sym &f=symbol(syms,s.pc[i]);
-    if(std::find(seen.begin(),seen.end(),f.name)==seen.end()){seen.push_back(f.name);incl[f.name][tag]++;}
-    if(i<6)st+=(i?" < ":"")+f.name;
-   }
-   stacks[st]++;
+   std::string st="t"+std::to_string(s.thread)+";";  // the registered thread, in registration order
+   for(int i=0;i<s.n;++i){st+=(i?";":"");st+=symbol(syms,s.pc[i]).name;}
+   const bool kernel=symbol(syms,s.pc[0]).kernel;
+   if(kernel)blocked++;
+   stacks[st][(kernel?2:0)+(s.tag==0?0:1)]++;
   }
   std::string file=dir()+"/"+getprogname()+"-cpuprof.txt",tmp=file+".tmp";
   FILE *f=fopen(tmp.c_str(),"w");
   if(!f)return;
-  uint64_t idle=0;for(Sample &s:samples)if(s.n&&(s.tag==2||symbol(syms,s.pc[0]).kernel))idle++;
-  fprintf(f,"# cpuprof v1 %s pid %d samples %llu enc %llu cpu %llu idle %llu period %u threads %zu\n",getprogname(),(int)getpid(),
-          (unsigned long long)samples.size(),(unsigned long long)counts[0],(unsigned long long)counts[1],(unsigned long long)idle,(unsigned)period,
-          threads().size());
-  auto top=[&](const char *title,std::map<std::string,uint64_t[2]> &m,size_t n){
-   std::vector<std::pair<uint64_t,const std::string *>> v;
-   for(auto &kv:m)v.push_back({kv.second[0]+kv.second[1],&kv.first});
-   std::sort(v.begin(),v.end(),[](auto &a,auto &b){return a.first>b.first;});
-   fprintf(f,"%s\n",title);
-   for(size_t i=0;i<v.size()&&i<n;++i)fprintf(f,"%7llu enc %6llu cpu %6llu  %s\n",(unsigned long long)v[i].first,(unsigned long long)m[*v[i].second][0],
-                                           (unsigned long long)m[*v[i].second][1],v[i].second->c_str());
-  };
-  top("self:",self,80);
-  top("incl:",incl,80);
-  std::vector<std::pair<uint64_t,const std::string *>> v;
-  for(auto &kv:stacks)v.push_back({kv.second,&kv.first});
-  std::sort(v.begin(),v.end(),[](auto &a,auto &b){return a.first>b.first;});
-  fprintf(f,"stack:\n");
-  for(size_t i=0;i<v.size()&&i<40;++i)fprintf(f,"%7llu  %s\n",(unsigned long long)v[i].first,v[i].second->c_str());
+  fprintf(f,"# cpuprof v2 %s pid %d samples %zu enc %llu cpu %llu blocked %llu period %u threads %zu\n",getprogname(),(int)getpid(),
+          samples.size(),(unsigned long long)counts[0],(unsigned long long)counts[1],(unsigned long long)blocked,(unsigned)period,threads().size());
+  fprintf(f,"# enc,cpu,blocked_enc,blocked_other,stack (innermost first, ';'-separated)\n");
+  for(auto &kv:stacks)fprintf(f,"%llu,%llu,%llu,%llu,%s\n",(unsigned long long)kv.second[0],(unsigned long long)kv.second[1],(unsigned long long)kv.second[2],(unsigned long long)kv.second[3],kv.first.c_str());
   fclose(f);
   rename(tmp.c_str(),file.c_str());
-  (void)total;
  };
  for(;;){
   usleep(period);
   std::vector<Thread> ts;
   {std::lock_guard<std::mutex> g(lock());ts=threads();}
   const int tag=open().load(std::memory_order_relaxed)>0?0:1;
-  for(Thread &t:ts){
+  for(size_t ti=0;ti<ts.size();++ti){
+   Thread &t=ts[ti];
    if(samples.size()>=(1u<<20))break;
-   Sample s{};s.tag=tag;
+   Sample s{};s.tag=tag;s.thread=(int)ti;
    if(thread_suspend(t.port)!=KERN_SUCCESS)continue;
    arm_thread_state64_t st;mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
    if(thread_get_state(t.port,ARM_THREAD_STATE64,(thread_state_t)&st,&count)==KERN_SUCCESS){
@@ -149,7 +132,7 @@ inline void *sampler(void *) {
     }
    }
    thread_resume(t.port);
-   counts[tag]++;++total;
+   counts[tag]++;
    samples.push_back(s);
   }
   const uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000000;
