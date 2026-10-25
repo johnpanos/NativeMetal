@@ -10,6 +10,12 @@
 
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
+#[path = "NativeMetalAlloc.rs"]
+mod alloc_cache;
+
+/// The system allocator, with a per-thread small-block cache under NMB_TCACHE=1 (NativeMetalAlloc.rs).
+#[global_allocator]
+static ALLOCATOR: alloc_cache::BridgeAlloc = alloc_cache::BridgeAlloc;
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
