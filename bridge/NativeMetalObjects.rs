@@ -180,6 +180,12 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         if std::env::var("NGPU_UNORM8_FILTER").as_deref() != Ok("exact") {
             options.policy.unorm8_linear_filter = metal2vulkan::device::Unorm8LinearFilterPolicy::DeviceWithinOneCode;
         }
+        // The same for a two-plane YCbCr surface (backboardd's 4:2:0 scan-out surfaces): the device's filter of the converted
+        // image instead of Metal's emulated on the 1/2048 grid (1079 instructions, 3.5 ms a full-screen draw on the A630).
+        // NGPU_YCBCR_FILTER=exact keeps Metal's.
+        if std::env::var("NGPU_YCBCR_FILTER").as_deref() != Ok("exact") {
+            options.policy.ycbcr_linear_filter = metal2vulkan::device::YCbCrLinearFilterPolicy::Device;
+        }
         // Opt-in (NGPU_TRUSTED_RENDER_SERVER=1 in the plugin's gpu-env, default off: it bought no GPU time on the A630): the render
         // server (backboardd) as trusted system code, its shaders without the translator's containment and guest isolation. Only
         // that process can take it; every other process keeps the untrusted-guest policy.
