@@ -2407,14 +2407,22 @@ static NSString *surfaceTextureKey(IOSurfaceRef surface,NSUInteger plane,MTLText
 @end
 
 // The device queries the runtime answers (nmb_device_answer_selector), as methods of the device class. One without an argument is read once
-// and installed only where the device has an answer of its own; one with an argument asks the runtime each call, and a refusal answers 0/NO
-// with the reason logged.
+// and installed only where the device has an answer of its own; one with an argument asks the runtime once per argument and keeps the answer
+// (every answer is a fixed property of the device; QuartzCore asks thousands a second while the screen moves), and a refusal answers 0/NO
+// with the reason logged once.
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ static std::mutex lock;
+ static std::unordered_map<SEL,std::unordered_map<NSUInteger,uint64_t>> kept;
+ {std::lock_guard<std::mutex> hold(lock);
+  auto answers=kept.find(cmd);
+  if(answers!=kept.end()){auto answer=answers->second.find(arg);if(answer!=answers->second.end())return answer->second;}}
  uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ std::lock_guard<std::mutex> hold(lock);
+ kept[cmd][arg]=value;
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
