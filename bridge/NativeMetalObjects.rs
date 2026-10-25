@@ -224,6 +224,28 @@ fn millis_after(text: &str, marker: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
+/// NGPU_MESSAGE_LOG=PATH (gpu-env, diagnostics): each distinct runtime message other than pipeline makings (its id and first 300
+/// characters), appended to PATH once, at most 2,000: the degradations behind a shadowed texture among them.
+fn message_log(message: &DebugMessage) {
+    use std::io::Write;
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<(std::fs::File, std::collections::HashSet<String>)>>> =
+        std::sync::OnceLock::new();
+    let Some(log) = LOG.get_or_init(|| {
+        let path = std::env::var_os("NGPU_MESSAGE_LOG")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(std::sync::Mutex::new((file, std::collections::HashSet::new())))
+    }) else {
+        return;
+    };
+    let text: String = message.text.chars().take(300).collect();
+    if let Ok(mut log) = log.lock() {
+        let line = format!("{} {}", message.id_name, text.replace('\n', " "));
+        if log.1.len() < 2000 && log.1.insert(line.clone()) {
+            let _ = writeln!(log.0, "{line}");
+        }
+    }
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
     if message.id_name == "metal2vulkan-pipeline-creation" {
@@ -238,6 +260,7 @@ fn observe_message(message: &DebugMessage) {
         }
         return;
     }
+    message_log(message);
     if message.severity >= MessageSeverity::Warning {
         OTHER_MESSAGES[1].fetch_add(1, Relaxed);
         if let Ok(mut last) = LAST_WARNING.lock() {
