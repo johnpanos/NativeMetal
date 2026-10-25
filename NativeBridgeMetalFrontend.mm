@@ -28,6 +28,7 @@
 #include "PipelineCapture.h"
 #include "FrameTrace.h"
 #include "PassTrace.h"
+#include "CpuProfile.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -701,6 +702,7 @@ static void notified(void *context,uint64_t value) {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
+ bool cpuOpen;  // counted open in the CPU profile (CpuProfile.h)
  // The frame trace (FrameTrace.h), when it is on: the commit's return, and the frontend's totals when the command buffer was made.
  uint64_t traceCommittedUs,tracePipeUs,tracePipeN,traceWaitUs,traceFlushUs,traceFlushBytes,traceDoneUs,traceHandledUs;
  std::atomic<int> traceJoin;   // the commit's return and the completion: the second writes the C line
@@ -1250,10 +1252,10 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
 @implementation NBCommandBuffer
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){createdUs=nowUs();if(ftrace::on())traceTotals(tracePipeUs,tracePipeN,traceWaitUs,traceFlushUs,traceFlushBytes);}
+ if(self){createdUs=nowUs();if(cpuprof::on()){cpuprof::note();cpuprof::opened();cpuOpen=true;}if(ftrace::on())traceTotals(tracePipeUs,tracePipeN,traceWaitUs,traceFlushUs,traceFlushBytes);}
  return self;
 }
-- (void)dealloc {nmb_command_buffer_release(_handle);}
+- (void)dealloc {if(cpuOpen)cpuprof::closed();nmb_command_buffer_release(_handle);}
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
 // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
@@ -1433,6 +1435,7 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
 - (void)commit {
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
+ if(cpuOpen){cpuOpen=false;cpuprof::closed();}
  if(_frame){fcap::commit(_frame.get());_frame=nullptr;}
  fcap::committed();
  self.committedUs=nowUs();
@@ -2128,7 +2131,7 @@ static void installAnswers(Class cls) {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
- passtrace::arm(cache);  // before the device opens: Turnip reads its u_trace settings once (PassTrace.h)
+ passtrace::arm(cache);cpuprof::arm(cache);  // before the device opens: Turnip reads its u_trace settings once (PassTrace.h)
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
