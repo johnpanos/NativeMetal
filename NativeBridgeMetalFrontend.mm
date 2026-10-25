@@ -984,7 +984,7 @@ static void noteGpuWritten(NBTexture *texture) {
 }
 static std::string gLoaderPath;
 static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
- static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return !(v && v[0]=='0');}();   // default on (tour clean 2026-10-25)   // opt-in until the correctness tour is clean
+ static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return !(v && v[0]=='0');}();   // default on (tour clean 2026-10-25)
  NBBuffer *buffer=texture.buffer;
  if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
  if(texture.parent)return;   // a view: its own shadow follows its parent's image, never a statement (noteSurfaceContents)
