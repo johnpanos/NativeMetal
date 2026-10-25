@@ -951,7 +951,9 @@ static bool asyncEncode() {
 }
 static std::atomic<uint64_t> gEncodeDeferred,gEncodeDrains;
 static void encodeRun(void (^block)(void)) {
- if(asyncEncode()){gEncodeDeferred++;dispatch_async(gEncodeQueue,block);}
+ // The CPU profile samples the worker's threads too (the translation of each command buffer runs there): a serial queue's blocks run
+ // on whichever pool thread GCD picks, each registered once (cpuprof::note is per thread).
+ if(asyncEncode()){gEncodeDeferred++;if(cpuprof::on())dispatch_async(gEncodeQueue,^{cpuprof::note();block();});else dispatch_async(gEncodeQueue,block);}
  else block();
 }
 static void encodeDrain() {
