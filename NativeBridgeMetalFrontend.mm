@@ -77,6 +77,7 @@ static void noteProblem(NSString *what) {
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
+static std::atomic<uint64_t> gSurfaceShared{0};
 static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
 // The last refused surface texture: the check that refused it (1 plane, 2 base, 3 plane range, 4 import, 5 texture), the surface's format,
 // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
@@ -164,6 +165,7 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
+- (id<MTLTexture>)view:(NmbTexture *)handle;
 @end
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
@@ -1930,11 +1932,22 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  if(xrFormat(descriptor.format)!=descriptor.format){descriptor.format=xrFormat(descriptor.format);gXrTextures++;}
+ noteTextureMade("device",d,(unsigned long)d.storageMode,0);
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
  if(!handle){NBLOG(@"native-metal: texture refused (format %lu %lux%lux%lu type %lu usage %lx storage %lu samples %lu): %@",(unsigned long)d.pixelFormat,
   (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.textureType,(unsigned long)d.usage,(unsigned long)d.storageMode,
   (unsigned long)d.sampleCount,lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+}
+// One texture per surface plane and descriptor (NGPU_SURFACE_SHARE=0 makes every call import its own): a later texture over the same
+// surface plane with the same descriptor is a view of the first live one, so the two share its shadow image. CoreAnimation wraps
+// its frame surfaces in several MTLTextures; each texture's own shadow forgot the other's at every copy back, so the full-screen
+// frame was copied in again every frame (fajita shadow log: 1125x2436 "forgotten" why=1, 32 GB in 86 s).
+static NSMapTable<NSString *,NBTexture *> *gSurfaceTexturesBySurface;
+static NSString *surfaceTextureKey(IOSurfaceRef surface,NSUInteger plane,MTLTextureDescriptor *d) {
+ return [NSString stringWithFormat:@"%u/%lu/%lu/%lux%lux%lu/%lu/%lu/%lu/%lu/%lu",IOSurfaceGetID(surface),(unsigned long)plane,(unsigned long)d.pixelFormat,
+  (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.textureType,(unsigned long)d.mipmapLevelCount,
+  (unsigned long)d.sampleCount,(unsigned long)d.arrayLength,(unsigned long)d.usage];
 }
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -1943,6 +1956,16 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
  if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
+ static const bool share=[]{const char *v=getenv("NGPU_SURFACE_SHARE");return !(v && v[0]=='0');}();
+ static dispatch_once_t made;dispatch_once(&made,^{gSurfaceTexturesBySurface=[NSMapTable strongToWeakObjectsMapTable];});
+ NSString *key=share?surfaceTextureKey(surface,plane,d):nil;
+ if(share) {
+  NBTexture *first=nil;@synchronized(gSurfaceTexturesBySurface){first=[gSurfaceTexturesBySurface objectForKey:key];}
+  if(first) {
+   id<MTLTexture> view=[first view:nmb_texture_new_view(first.handle,(uint64_t)d.pixelFormat,0,nullptr,nullptr,true)];
+   if(view){gSurfaceShared++;gSurfaceTextures++;return view;}
+  }
+ }
  if(planes)gSurfacePlanar++;
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
@@ -1953,7 +1976,9 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);
+ if(share){@synchronized(gSurfaceTexturesBySurface){[gSurfaceTexturesBySurface setObject:texture forKey:key];}}
+ return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
