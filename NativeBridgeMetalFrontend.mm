@@ -971,7 +971,8 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
  NBBuffer *buffer=texture.buffer;
  if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
  if(buffer.copySource) {
-  if(buffer.contentsTouched)return;
+  // Once its contents was asked for, the CPU may write it unseen: no generation (every use copies in again).
+  if(buffer.contentsTouched){if(texture.cpuGeneration){texture.cpuGeneration=0;nmb_texture_set_contents_generation(texture.handle,0);}return;}
   static const bool everyCommit=[]{const char *v=getenv("NGPU_HOST_COPY");return v && v[0]=='2';}();
   if(everyCommit)return;
   if(!texture.cpuGeneration){texture.cpuGeneration=1;nmb_texture_set_contents_generation(texture.handle,1);}
