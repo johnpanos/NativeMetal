@@ -72,6 +72,8 @@ inline std::string keyFor(const std::string &kind,const char *args) {
  std::string k=kind;
  std::string w=arg(args,"width"),h=arg(args,"height");
  if(!w.empty())k+=" "+w+"x"+h;
+ std::string format=arg(args,"format");  // transfers: copy_buffer_to_image format=b8g8r8a8_unorm, ...
+ if(!format.empty())k+=" "+format;
  return k;
 }
 
