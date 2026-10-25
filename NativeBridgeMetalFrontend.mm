@@ -27,6 +27,7 @@
 #include "NativeBridgeMetalFrontend.h"
 #include "PipelineCapture.h"
 #include "FrameTrace.h"
+#include "PassTrace.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -2127,6 +2128,7 @@ static void installAnswers(Class cls) {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
+ passtrace::arm(cache);  // before the device opens: Turnip reads its u_trace settings once (PassTrace.h)
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
@@ -2348,6 +2350,7 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
 // The scanout client's swaps for the frame trace (GpuScanoutClient.h declares it weak).
 extern "C" void NBTraceSwap(uint64_t sequence,uint64_t waitUs,uint64_t offerUs,uint64_t presentedUs,uint64_t completedUs,uint32_t width,uint32_t height,
                             uint32_t mapId,int result) {
+ passtrace::swaps().fetch_add(1,std::memory_order_relaxed);
  if(!ftrace::on())return;
  ftrace::linef("S,%llu,%llu,%llu,%llu,%llu,%u,%u,%u,%d",(unsigned long long)sequence,(unsigned long long)waitUs,(unsigned long long)offerUs,
                (unsigned long long)presentedUs,(unsigned long long)completedUs,width,height,mapId,result);
