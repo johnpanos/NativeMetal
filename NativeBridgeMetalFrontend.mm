@@ -168,7 +168,7 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 - (id<MTLTexture>)view:(NmbTexture *)handle;
-@property(nonatomic) uint64_t cpuGeneration,cpuCheckedIn;   // CPU-written texture over a buffer: its stated generation, last command buffer checked
+@property(nonatomic) uint64_t cpuGeneration,cpuCheckedIn,cpuHash;   // CPU-written texture over a buffer: its stated generation, last command buffer checked
 @end
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
@@ -197,8 +197,9 @@ static std::atomic<int64_t> gLiveBuffers,gLiveCopies,gLiveTextures;
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
-- (void)didModifyRange:(NSRange)range {(void)range;}
+- (void)didModifyRange:(NSRange)range {(void)range;_writeGeneration=_writeGeneration+1;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+ if(state==MTLPurgeableStateEmpty || state==MTLPurgeableStateVolatile)_writeGeneration=_writeGeneration+1;   // the bytes may go (noteCpuContents)
  const uint64_t answer=nmb_buffer_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: buffer setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
@@ -369,6 +370,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (id<MTLTexture>)parentTexture {return _parent;}
 - (NSUInteger)rotation {return 0;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+ if(_buffer && (state==MTLPurgeableStateEmpty || state==MTLPurgeableStateVolatile))_buffer.writeGeneration=_buffer.writeGeneration+1;
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
  return (MTLPurgeableState)answer;
@@ -970,7 +972,7 @@ static void noteSurfaceContents(NBTexture *texture) {
 static int (*gHostDirty)(const uint64_t *,uint32_t,uint32_t *,uint32_t *);
 static std::string gLoaderPath;
 static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
- static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return v && v[0]=='1';}();   // opt-in until the correctness tour is clean
+ static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return v && (v[0]=='1' || v[0]=='2');}();   // opt-in until the correctness tour is clean
  NBBuffer *buffer=texture.buffer;
  if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
  if(buffer.copySource) {
@@ -980,6 +982,22 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
   if(everyCommit)return;
   // replaceRegion on any texture over the bytes moves the generation of every texture over them.
   const uint64_t generation=1+buffer.writeGeneration;
+  // NGPU_CPU_HELD=2 (diagnostics): hash the bytes at each bind; a change under an unchanged generation is a write the rules missed.
+  static const bool check=[]{const char *v=getenv("NGPU_CPU_HELD");return v && v[0]=='2';}();
+  if(check) {
+   const NmbTextureDescriptor &d=texture.descriptor;
+   const uint8_t *bytes=(const uint8_t *)nmb_buffer_contents(buffer.handle);   // not the property: it would mark the buffer touched
+   const size_t length=(size_t)texture.rowBytes*(d.height?d.height:1);
+   uint64_t h=1469598103934665603ull;
+   if(bytes && texture.offset+length<=buffer.copyBytes)for(size_t i=0;i<length;i+=8){uint64_t w=0;memcpy(&w,bytes+texture.offset+i,length-i<8?length-i:8);h=(h^w)*1099511628211ull;}
+   if(texture.cpuGeneration==generation && texture.cpuHash && h!=texture.cpuHash) {
+    static std::atomic<int> said{0};
+    if(said++<20){char line[200];snprintf(line,sizeof line,"P cpu held MISSED: %llux%llu format %llu row %lu offset %lu buffer %lu generation %llu",
+     (unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.format,(unsigned long)texture.rowBytes,(unsigned long)texture.offset,
+     (unsigned long)buffer.copyBytes,(unsigned long long)generation);journal(line);}
+   }
+   texture.cpuHash=h;
+  }
   if(texture.cpuGeneration!=generation){texture.cpuGeneration=generation;nmb_texture_set_contents_generation(texture.handle,generation);}
   return;
  }
