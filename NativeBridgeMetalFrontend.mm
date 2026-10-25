@@ -1022,7 +1022,7 @@ static void noteSurfaceContents(NBTexture *texture) {
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
  [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
- [self frameCommand:"{\"pipeline\":\"c"+std::to_string([(NBComputePipeline *)state captureId])+"\"}"];
+ if(self.frame)[self frameCommand:"{\"pipeline\":\"c"+std::to_string([(NBComputePipeline *)state captureId])+"\"}"];
 }
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
 - (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:0];}
@@ -1037,13 +1037,13 @@ static void noteSurfaceContents(NBTexture *texture) {
 - (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:0];}
 - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
  [self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"];
- [self frameCommand:"{\"threadgroupMemory\":{\"index\":"+std::to_string((unsigned long long)(i))+",\"length\":"+std::to_string((unsigned long long)(n))+"}}"];
+ if(self.frame)[self frameCommand:"{\"threadgroupMemory\":{\"index\":"+std::to_string((unsigned long long)(i))+",\"length\":"+std::to_string((unsigned long long)(n))+"}}"];
 }
 - (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
  [self check:nmb_compute_dispatch(self.handle,s,g,threads) what:"dispatch"];
- [self frameCommand:threads?"{\"dispatchThreads\":{\"grid\":"+fcap::triple(s[0],s[1],s[2])+",\"threads\":"+fcap::triple(g[0],g[1],g[2])+"}}":
+ if(self.frame)[self frameCommand:threads?"{\"dispatchThreads\":{\"grid\":"+fcap::triple(s[0],s[1],s[2])+",\"threads\":"+fcap::triple(g[0],g[1],g[2])+"}}":
      "{\"dispatchThreadgroups\":{\"groups\":"+fcap::triple(s[0],s[1],s[2])+",\"threads\":"+fcap::triple(g[0],g[1],g[2])+"}}"];
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
@@ -1060,7 +1060,7 @@ static void noteSurfaceContents(NBTexture *texture) {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handleForXr:_passXr]) what:"setRenderPipelineState"];
  if(self.capture)self.capture->pipeline=[(NBRenderPipeline *)state captureId];
- [self frameCommand:"{\"pipeline\":\"r"+std::to_string([(NBRenderPipeline *)state captureId])+"\"}"];
+ if(self.frame)[self frameCommand:"{\"pipeline\":\"r"+std::to_string([(NBRenderPipeline *)state captureId])+"\"}"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
@@ -1084,13 +1084,13 @@ static void noteSurfaceContents(NBTexture *texture) {
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
- if(self.frame && state)[self frameCommand:"{\"depthStencil\":\""+fcap::depthStencil((NBDepthStencil *)state)+"\"}"];
+ if(self.frame && state)if(self.frame)[self frameCommand:"{\"depthStencil\":\""+fcap::depthStencil((NBDepthStencil *)state)+"\"}"];
  if(self.capture)self.capture->depthStencil=state?[(NBDepthStencil *)state captureText]:std::string("null");
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
- if(self.frame){std::string s="{\"viewport\":[";for(int i=0;i<6;i++)s+=(i?",":"")+fcap::num(values[i]);[self frameCommand:s+"]}"];}
+ if(self.frame){std::string s="{\"viewport\":[";for(int i=0;i<6;i++)s+=(i?",":"")+fcap::num(values[i]);if(self.frame)[self frameCommand:s+"]}"];}
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
@@ -1103,12 +1103,12 @@ static void noteSurfaceContents(NBTexture *texture) {
  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
  if(self.capture)self.capture->raster="["+std::to_string(cull.unsignedLongLongValue)+","+std::to_string(winding.unsignedLongLongValue)+","+std::to_string(fill.unsignedLongLongValue)+"]";
 }
-- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];[self frameCommand:"{\"cull\":"+std::to_string((unsigned long long)(m))+"}"];}
-- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];[self frameCommand:"{\"winding\":"+std::to_string((unsigned long long)(w))+"}"];}
-- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];[self frameCommand:"{\"fill\":"+std::to_string((unsigned long long)(f))+"}"];}
+- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];if(self.frame)[self frameCommand:"{\"cull\":"+std::to_string((unsigned long long)(m))+"}"];}
+- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];if(self.frame)[self frameCommand:"{\"winding\":"+std::to_string((unsigned long long)(w))+"}"];}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];if(self.frame)[self frameCommand:"{\"fill\":"+std::to_string((unsigned long long)(f))+"}"];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
- [self frameCommand:"{\"depthBias\":["+fcap::num(bias)+","+fcap::num(slope)+","+fcap::num(clamp)+"]}"];
+ if(self.frame)[self frameCommand:"{\"depthBias\":["+fcap::num(bias)+","+fcap::num(slope)+","+fcap::num(clamp)+"]}"];
 }
 - (void)setLineWidth:(float)width {[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
@@ -1125,20 +1125,20 @@ static void noteSurfaceContents(NBTexture *texture) {
 - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];[self frameCommand:"{\"stencilRef\":"+std::to_string(v)+"}"];}
+- (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];if(self.frame)[self frameCommand:"{\"stencilRef\":"+std::to_string(v)+"}"];}
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
  [self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];
- [self frameCommand:"{\"stencilRef\":"+std::to_string(f)+"}"];
+ if(self.frame)[self frameCommand:"{\"stencilRef\":"+std::to_string(f)+"}"];
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
- [self frameCommand:"{\"blendColor\":["+fcap::num(r)+","+fcap::num(g)+","+fcap::num(b)+","+fcap::num(a)+"]}"];
+ if(self.frame)[self frameCommand:"{\"blendColor\":["+fcap::num(r)+","+fcap::num(g)+","+fcap::num(b)+","+fcap::num(a)+"]}"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
  if(self.capture)pcap::draw(*self.capture,t,-1);
- [self frameCommand:"{\"draw\":{\"primitive\":"+std::to_string((unsigned long long)(t))+",\"start\":"+std::to_string((unsigned long long)(s))+",\"count\":"+std::to_string((unsigned long long)(n))+",\"instances\":"+std::to_string((unsigned long long)(i))+",\"baseInstance\":"+std::to_string((unsigned long long)(b))+"}}"];
+ if(self.frame)[self frameCommand:"{\"draw\":{\"primitive\":"+std::to_string((unsigned long long)(t))+",\"start\":"+std::to_string((unsigned long long)(s))+",\"count\":"+std::to_string((unsigned long long)(n))+",\"instances\":"+std::to_string((unsigned long long)(i))+",\"baseInstance\":"+std::to_string((unsigned long long)(b))+"}}"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
