@@ -35,24 +35,39 @@ struct Frame {
     size_t stride;
     uint32_t width, height;
     uint32_t mapId;   // NGPSwap.reserved: nonzero when the kernel keeps this mapping across swaps, so its import can be kept too
+    unsigned target = 0;   // NGPSwap.target: 0 the scanout, 1 the back buffer (double-buffered scan-out)
+    bool flip = false;     // NGPSwap.flags bit 0: the display flips to the target, so the copy completes before the swap does
 };
 
 enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
 
 class Presenter {
 public:
-    Presenter(id<MTLDevice> device, const Scanout &scanout) : device_(device), scanout_(scanout) {
+    // `back`: the double-buffered scan-out's second buffer, the same size and layout as the scanout (null: one buffer).
+    Presenter(id<MTLDevice> device, const Scanout &scanout, const void *back = nullptr) : device_(device), scanout_(scanout) {
         queue_ = [device newCommandQueue];
         queue_.label = @"ngpu.present";
         if (!validScanout() || !queue_) return;
-        target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        targets_[0] = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (back && !((uintptr_t)back & (getpagesize() - 1)))
+            targets_[1] = [device newBufferWithBytesNoCopy:(void *)back length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        target_ = targets_[0];
     }
+    bool doubleBuffered() const { return targets_[1] != nil; }
     bool ready() const { return target_ != nil; }
     // Last scaled-path failure (0 none): 1 no metallib section, 2 library, 3 function, 4 pipeline, 5 geometry, 6 taps.
     int scaleError() const { return scaleError_; }
     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
     Result present(const Frame &frame) {
         if (!ready()) return kBadScanout;
+        if (frame.target > 1 || !targets_[frame.target]) return kBadScanout;
+        target_ = targets_[frame.target];
+        letterboxed_ = letterboxedAt_[frame.target];
+        const Result r = presentTo(frame);
+        letterboxedAt_[frame.target] = letterboxed_;
+        return r;
+    }
+    Result presentTo(const Frame &frame) {
         // An experiment (NGPU_PRESENT_SKIP_FILE=1 in gpu-env, off by default): while the file /private/var/ngpu/present-skip exists, a
         // frame is handed back without its copy (the screen keeps its old contents), to measure the frame rate without the presenter. An
         // empty file turns it off again.
@@ -118,7 +133,7 @@ private:
             [previous waitUntilCompleted];
             if (previous.status != MTLCommandBufferStatusCompleted) {[commands waitUntilCompleted]; return kGpuFailed;}
         }
-        if (frame.mapId && pipelineAllowed()) {pending_ = commands; ++pipelined_; return kOk;}
+        if (frame.mapId && !frame.flip && pipelineAllowed()) {pending_ = commands; ++pipelined_; return kOk;}
         [commands waitUntilCompleted];
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
@@ -256,6 +271,8 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
+    id<MTLBuffer> targets_[2] = {nil, nil};
+    bool letterboxedAt_[2] = {false, false};
     id<MTLComputePipelineState> pipeline_ = nil, pipeline4_ = nil, pipeline4v_ = nil;
     bool span2_ = false;
     id<MTLBuffer> taps_ = nil;

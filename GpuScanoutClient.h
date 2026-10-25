@@ -10,7 +10,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"
-#include "../NativeMobileDisplay/NativeGOPWire.h"
+#include "NativeGOPWire.h"
 
 // The native frontend's frame trace (FrameTrace.h): one S line per swap. A no-op elsewhere; the frontend's definition replaces this one.
 extern "C" __attribute__((weak)) void NBTraceSwap(uint64_t sequence, uint64_t waitUs, uint64_t offerUs, uint64_t presentedUs, uint64_t completedUs,
@@ -28,6 +28,8 @@ struct Transport {
     int (*mapScanout)(void *context, uint64_t *address, uint64_t *length);
     // Progress marker (the plugin shows the latest ones on the boot page, which survives a panic that parks the calling core).
     void (*mark)(void *context, uint32_t value);
+    // The double-buffered scan-out's back buffer, writable, mapped into this task (null, or nonzero: one buffer).
+    int (*mapBack)(void *context, uint64_t *address, uint64_t *length);
 };
 
 struct Stats {
@@ -66,7 +68,10 @@ public:
                                        (uint32_t)mode.width, (uint32_t)mode.height};
         note(0x6714);
         scanout_ = scanout;
-        presenter_ = new gpupresent::Presenter(device, scanout);
+        // The back buffer, where the kernel flips (fajita-fb-flip=1); without it every frame goes to the one scanout.
+        uint64_t back = 0, backLength = 0;
+        if (transport_.mapBack && (transport_.mapBack(transport_.context, &back, &backLength) || backLength < mode.bytes)) back = 0;
+        presenter_ = new gpupresent::Presenter(device, scanout, (const void *)(uintptr_t)back);
         note(0x6715);
         if (!presenter_->ready()) return fail(3, 0);
         stats_->step = 4;
@@ -90,7 +95,8 @@ public:
         note(0x6730);   // a frame was offered
         const uint64_t began = mach_absolute_time();
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
-                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved});
+                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved, swap.target,
+                                                          (swap.flags & 1u) != 0});
         {
             static mach_timebase_info_data_t base;
             if (!base.denom) mach_timebase_info(&base);
@@ -100,10 +106,10 @@ public:
         stats_->lastResult = (int)r;
         stats_->scaleError = presenter_->scaleError();
         stats_->importsKept = presenter_->importsKept();
-        if (r == gpupresent::kOk && !swap.reserved && stats_->verified < 4 && swap.width == scanout_.width && swap.height == scanout_.height) verify(swap);
+        if (r == gpupresent::kOk && !swap.reserved && !swap.target && stats_->verified < 4 && swap.width == scanout_.width && swap.height == scanout_.height) verify(swap);
         note(0x6731);   // the GPU copy returned
         const uint64_t presented = mach_absolute_time();
-        NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
+        NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, swap.target};
         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
         {
             static mach_timebase_info_data_t base;
