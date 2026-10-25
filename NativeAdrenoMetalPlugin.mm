@@ -229,7 +229,17 @@ static id deviceForPort(unsigned port) {
                 line[strcspn(line, "\r\n")] = 0;
                 if (char *eq = strchr(line, '=')) {
                     *eq = 0;
-                    if (line[0] && line[0] != '#') setenv(line, eq + 1, 1);
+                    // %p in a value is the process's pid and %n its name, so a per-process file (MESA_GPU_TRACEFILE=.../ut-%n-%p.csv)
+                    // is never written by another process that started while the line was set.
+                    char value[320];
+                    size_t o = 0;
+                    for (const char *v = eq + 1; *v && o + 64 < sizeof value; ++v) {
+                        if (v[0] == '%' && v[1] == 'p') {o += (size_t)snprintf(value + o, sizeof value - o, "%d", (int)getpid()); ++v;}
+                        else if (v[0] == '%' && v[1] == 'n') {o += (size_t)snprintf(value + o, sizeof value - o, "%s", getprogname()); ++v;}
+                        else value[o++] = *v;
+                    }
+                    value[o] = 0;
+                    if (line[0] && line[0] != '#') setenv(line, value, 1);
                 }
             }
             fclose(f);
