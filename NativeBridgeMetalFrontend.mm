@@ -173,8 +173,12 @@ static void releaseBlock(void *context,void *pointer,uint64_t length) {
 }
 static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
 static void hostBufferGone(void *base);
+// Live objects (leakwatch.sh): buffers, the copy-mode copies among them, textures.
+static std::atomic<int64_t> gLiveBuffers,gLiveCopies,gLiveTextures;
 @implementation NBBuffer
+- (instancetype)init {if((self=[super init]))gLiveBuffers++;return self;}
 - (void)dealloc {
+ gLiveBuffers--;if(_copySource)gLiveCopies--;
  nmb_buffer_release(_handle);
  if(_hostCounted)hostBufferGone(_wrapped);
  if(_copyDeallocator)_copyDeallocator(_copySource,_copyBytes);
@@ -335,7 +339,8 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  return true;
 }
 @implementation NBTexture
-- (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+- (instancetype)init {if((self=[super init]))gLiveTextures++;return self;}
+- (void)dealloc {gLiveTextures--;nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
 - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
 - (NSUInteger)width {return _descriptor.width;}
@@ -1883,7 +1888,7 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
  if(copyMode && !(options&MTLResourceStorageModePrivate) && length<=(4u<<20)) {
   NmbBuffer *owned=nmb_buffer_new(gDevice,length,options&~MTLResourceStorageModeMask,pointer);
   if(!owned){NBLOG(@"native-metal: host copy refused: %@",lastError());return nil;}
-  gNoCopyAll++;gHostCopies++;gHostCopyBytes+=length;
+  gNoCopyAll++;gHostCopies++;gHostCopyBytes+=length;gLiveCopies++;
   NBBuffer *buffer=[NBBuffer new];buffer.handle=owned;buffer.options=options;
   buffer.copySource=pointer;buffer.copyBytes=length;buffer.copyDeallocator=deallocator;
   {std::lock_guard<std::mutex> lock(gImportLock);if(!gImports)gImports=[NSHashTable weakObjectsHashTable];[gImports addObject:buffer];}
@@ -2291,6 +2296,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("N live buffers %lld copies %lld textures %lld",(long long)gLiveBuffers.load(),(long long)gLiveCopies.load(),(long long)gLiveTextures.load());
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
