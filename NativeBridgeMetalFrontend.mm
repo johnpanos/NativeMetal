@@ -169,6 +169,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NSUInteger heapOffset;
 - (id<MTLTexture>)view:(NmbTexture *)handle;
 @property(nonatomic) uint64_t cpuGeneration,cpuCheckedIn,cpuHash;
+@property(atomic) uint64_t heldSalt;   // moved when a command buffer that used the texture never ran (staleHeld): its copy in may not have
 @property(atomic) BOOL gpuWritten;   // its root was a render target, a blit operand or a compute texture: never CPU-held (noteCpuContents)   // CPU-written texture over a buffer: its stated generation, last command buffer checked
 @end
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
@@ -992,7 +993,7 @@ static void noteSurfaceContents(NBTexture *texture) {
  // Only the root: a view's own shadow (another component layout) is copied from its parent's image, which a later copy in from the
  // bytes refreshes without the view's statement moving, so a stated view could keep what it copied before (fajita: garbage icons).
  for(NBTexture *t=texture;t;t=[t.parent isKindOfClass:[NBTexture class]]?(NBTexture *)t.parent:nil)
-  if(!t.parent)nmb_texture_set_contents_generation(t.handle,generation);
+  if(!t.parent)nmb_texture_set_contents_generation(t.handle,generation+(t.heldSalt<<40));
  gSurfaceGenerations++;
 }
 // A texture over a buffer's bytes whose generation the frontend can state (NGPU_CPU_HELD=1, opt-in: off, every use copies in; =2 also
@@ -1004,6 +1005,19 @@ static void noteSurfaceContents(NBTexture *texture) {
 // The runtime then copies the texture's bytes into its shadow image only when they changed (fajita shadow log: 1271x1823 and 1326x1326
 // textures over the wallpaper's pages copied in at every use, 19 GB in 86 s; 180x180 icons and labels over copies, about 50,000).
 static int (*gHostDirty)(const uint64_t *,uint32_t,uint32_t *,uint32_t *);
+// A command buffer that never ran its commands (released uncommitted, refused, failed): the copies into the shadows of the textures it
+// used may not have happened, though the runtime marked them held when it planned them. Each root's generation moves (heldSalt; a
+// HostDirty texture's generation steps), so its next use copies in again (fajita: a garbage dock icon after backboardd restarts, 2 of 6).
+static void staleHeld(NSSet *owners) {
+ for(id o in owners) {
+  if(![o isKindOfClass:[NBTexture class]])continue;
+  NBTexture *root=(NBTexture *)o;
+  while([root.parent isKindOfClass:[NBTexture class]])root=(NBTexture *)root.parent;
+  root.heldSalt=root.heldSalt+1;
+  if(root.cpuGeneration)root.cpuGeneration=root.cpuGeneration+1;
+  nmb_texture_set_contents_generation(root.handle,0);
+ }
+}
 // A texture the GPU may write (an attachment, a blit operand, a compute encoder's texture): its root is never CPU-held again.
 static void noteGpuWritten(NBTexture *texture) {
  NBTexture *root=texture;
@@ -1025,7 +1039,7 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
   static const bool everyCommit=[]{const char *v=getenv("NGPU_HOST_COPY");return v && v[0]=='2';}();
   if(everyCommit)return;
   // replaceRegion on any texture over the bytes moves the generation of every texture over them.
-  const uint64_t generation=1+buffer.writeGeneration;
+  const uint64_t generation=1+buffer.writeGeneration+(texture.heldSalt<<40);
   // NGPU_CPU_HELD=2 (diagnostics): hash the bytes at each bind; a change under an unchanged generation is a write the rules missed.
   static const bool check=[]{const char *v=getenv("NGPU_CPU_HELD");return v && v[0]=='2';}();
   if(check) {
@@ -1397,7 +1411,11 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
  if(self){createdUs=nowUs();if(cpuprof::on()){cpuprof::note();cpuprof::opened();cpuOpen=true;}if(ftrace::on())traceTotals(tracePipeUs,tracePipeN,traceWaitUs,traceFlushUs,traceFlushBytes);}
  return self;
 }
-- (void)dealloc {if(cpuOpen)cpuprof::closed();nmb_command_buffer_release(_handle);}
+- (void)dealloc {
+ if(cpuOpen)cpuprof::closed();
+ if(!self.committed && _resourceOwners.count)staleHeld(_resourceOwners);
+ nmb_command_buffer_release(_handle);
+}
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
 // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
@@ -1569,6 +1587,7 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  flushSurfaces(_surfaces);
+ if(self.failedLocally || nmb_command_buffer_status(_handle)==(uint64_t)MTLCommandBufferStatusError)staleHeld(_resourceOwners);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
