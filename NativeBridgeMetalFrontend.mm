@@ -984,12 +984,20 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
   if(void *lib=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOLOAD|RTLD_LAZY))
    gHostDirty=(int (*)(const uint64_t *,uint32_t,uint32_t *))dlsym(lib,"tu_darwin_host_dirty");
  });
- if(!gHostDirty)return;
+ if(!gHostDirty) {
+  static std::atomic<bool> said{false};
+  if(!said.exchange(true))journal("P host dirty: tu_darwin_host_dirty not found in "+gLoaderPath+": "+std::string(dlerror()?:"?"));
+  return;
+ }
  texture.cpuCheckedIn=commands->serial;
  const NmbTextureDescriptor &d=texture.descriptor;
  const uint64_t range[2]={(uint64_t)(uintptr_t)buffer.wrapped+texture.offset,(uint64_t)texture.rowBytes*(d.height?d.height:1)};
  uint32_t dirty=~0u;
- if(gHostDirty(range,1,&dirty)!=0)return;   // an older kernel: no statement
+ if(const int kr=gHostDirty(range,1,&dirty)) {   // an older kernel: no statement
+  static std::atomic<int> said{0};
+  if(said++<4){char line[160];snprintf(line,sizeof line,"P host dirty: error %x for %llx+%llx",kr,(unsigned long long)range[0],(unsigned long long)range[1]);journal(line);}
+  return;
+ }
  if((dirty&1) || !texture.cpuGeneration)texture.cpuGeneration++;
  nmb_texture_set_contents_generation(texture.handle,texture.cpuGeneration);
 }
