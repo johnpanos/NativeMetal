@@ -996,7 +996,7 @@ static void noteSurfaceContents(NBTexture *texture) {
   if(!t.parent)nmb_texture_set_contents_generation(t.handle,generation+(t.heldSalt<<40));
  gSurfaceGenerations++;
 }
-// A texture over a buffer's bytes whose generation the frontend can state (NGPU_CPU_HELD=1, opt-in: off, every use copies in; =2 also
+// A texture over a buffer's bytes whose generation the frontend can state (NGPU_CPU_HELD=0 turns it off: every use copies in; =2 also
 // hashes copy-backed bytes at every bind and journals writes the rules missed):
 //  - a no-copy buffer's GPU-owned copy (NGPU_HOST_COPY's default, the bytes copied once at creation): only a writer through `contents`
 //    changes them, so its texture states a constant generation until the first `contents` call;
@@ -1028,7 +1028,7 @@ static void noteGpuWritten(NBTexture *texture) {
 }
 static std::string gLoaderPath;
 static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
- static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return v && (v[0]=='1' || v[0]=='2');}();   // opt-in: an intermittent garbage icon after backboardd restarts (2 of 5), 2026-10-25
+ static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return !(v && v[0]=='0');}();   // default on: 13 of 13 restarts and a tour clean with staleHeld (2026-10-25)
  NBBuffer *buffer=texture.buffer;
  if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
  if(texture.parent)return;   // a view: its own shadow follows its parent's image, never a statement (noteSurfaceContents)
