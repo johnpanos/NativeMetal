@@ -168,7 +168,8 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 - (id<MTLTexture>)view:(NmbTexture *)handle;
-@property(nonatomic) uint64_t cpuGeneration,cpuCheckedIn,cpuHash;   // CPU-written texture over a buffer: its stated generation, last command buffer checked
+@property(nonatomic) uint64_t cpuGeneration,cpuCheckedIn,cpuHash;
+@property(atomic) BOOL gpuWritten;   // its root was a render target, a blit operand or a compute texture: never CPU-held (noteCpuContents)   // CPU-written texture over a buffer: its stated generation, last command buffer checked
 @end
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
@@ -972,12 +973,21 @@ static void noteSurfaceContents(NBTexture *texture) {
 // The runtime then copies the texture's bytes into its shadow image only when they changed (fajita shadow log: 1271x1823 and 1326x1326
 // textures over the wallpaper's pages copied in at every use, 19 GB in 86 s; 180x180 icons and labels over copies, about 50,000).
 static int (*gHostDirty)(const uint64_t *,uint32_t,uint32_t *,uint32_t *);
+// A texture the GPU may write (an attachment, a blit operand, a compute encoder's texture): its root is never CPU-held again.
+static void noteGpuWritten(NBTexture *texture) {
+ NBTexture *root=texture;
+ while([root.parent isKindOfClass:[NBTexture class]])root=(NBTexture *)root.parent;
+ if(root.gpuWritten)return;
+ root.gpuWritten=YES;
+ if(root.cpuGeneration){root.cpuGeneration=0;nmb_texture_set_contents_generation(root.handle,0);}
+}
 static std::string gLoaderPath;
 static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
  static const bool on=[]{const char *v=getenv("NGPU_CPU_HELD");return v && (v[0]=='1' || v[0]=='2');}();   // opt-in until the correctness tour is clean
  NBBuffer *buffer=texture.buffer;
  if(!on || texture.surface || !buffer || buffer.importSurface || !commands)return;
  if(texture.parent)return;   // a view: its own shadow follows its parent's image, never a statement (noteSurfaceContents)
+ if(texture.gpuWritten)return;   // the GPU writes it (noteGpuWritten): every use copies in
  if(buffer.copySource) {
   // Once its contents was asked for, the CPU may write it unseen: no generation (every use copies in again).
   if(buffer.contentsTouched){if(texture.cpuGeneration){texture.cpuGeneration=0;nmb_texture_set_contents_generation(texture.handle,0);}return;}
@@ -1069,6 +1079,7 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
   [_commandBuffer.surfaces addObject:texture];
   noteSurfaceContents((NBTexture *)texture);
  }
+ if(texture && stage==0 && ((NBTexture *)texture).buffer && !((NBTexture *)texture).surface)noteGpuWritten((NBTexture *)texture);
  if(texture)noteCpuContents((NBTexture *)texture,_commandBuffer);
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
  if(_frame && texture)_frame->commands.push_back(std::string("{\"texture\":{\"stage\":\"")+fcap::stageName(stage)+"\",\"index\":"+std::to_string(index)+",\"texture\":\""+
@@ -1280,6 +1291,7 @@ static void noteCpuContents(NBTexture *texture,NBCommandBuffer *commands) {
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer.resourceOwners addObject:o];
   if([(NBTexture *)o surface]){[self.commandBuffer.surfaces addObject:o];noteSurfaceContents((NBTexture *)o);}
+  else if(((NBTexture *)o).buffer)noteGpuWritten((NBTexture *)o);
  }
  return true;
 }
@@ -1414,6 +1426,7 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];noteSurfaceContents(texture);}
+  if(texture.buffer && !texture.surface)noteGpuWritten(texture);
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   return true;
