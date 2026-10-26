@@ -130,7 +130,11 @@ private:
         static const bool on = [] {const char *v = getenv("NGPU_PRESENT_PIPELINE"); return !(v && v[0] == '0');}();
         return on;
     }
+    // The last flipped frame's command buffer, released at the next frame (while that one's copy waits for the GPU): releasing it
+    // right after its wait put its teardown between the copy's completion and the swap's (1.4-1.9 ms median, gfx suite, home).
+    id<MTLCommandBuffer> done_ = nil;
     Result finish(id<MTLCommandBuffer> commands, const Frame &frame) {
+        done_ = nil;
         id<MTLCommandBuffer> previous = pending_;
         pending_ = nil;
         if (previous) {
@@ -139,7 +143,9 @@ private:
         }
         if (frame.mapId && !frame.flip && pipelineAllowed()) {pending_ = commands; ++pipelined_; return kOk;}
         [commands waitUntilCompleted];
-        return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+        const bool ok = commands.status == MTLCommandBufferStatusCompleted;
+        if (frame.flip) done_ = commands;
+        return ok ? kOk : kGpuFailed;
     }
     static const unsigned kImports = 4;
     struct Import { uint32_t mapId; const void *base; size_t bytes; uint64_t used; id<MTLBuffer> buffer; };
