@@ -148,6 +148,7 @@ inline void arm(const char *cache) {
  dir()=std::string(cache)+"/frametrace";
  mkdir(dir().c_str(),0755);
  armed()=true;
+ fprintf(stderr,"native-metal: CPU profiler ON for %s (NGPU_CPU_PROFILE): every Metal thread sampled; timings are not representative\n",getprogname());
  pthread_t t;
  if(pthread_create(&t,nullptr,sampler,nullptr)!=0){armed()=false;return;}
  pthread_detach(t);
