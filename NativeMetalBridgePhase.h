@@ -14,6 +14,9 @@
 #include "GpuScanoutClient.h"
 #include <fcntl.h>
 #include <pthread.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -94,6 +97,22 @@ struct ScanoutContext {
 static void serveScanout(Gpu &gpu, id device) {
     // This thread carries every frame to the screen; at the default priority it waited behind the launching apps' threads.
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    // And as a real-time thread (Mach time constraint: 1.5 ms of CPU a frame period, due within 5 ms), as the render server's own
+    // display thread runs: at user-interactive (47) it lost the CPU to CoreAnimation's threads (54-63) right after its copy completed,
+    // and the swap's completion reached the display 1.9 ms later (median; p90 4.5, max 22 ms; gfx suite, home), every frame on the
+    // critical path. NGPU_PRESENT_RT=0 (gpu-env) keeps the plain QoS.
+    {
+        const char *v = getenv("NGPU_PRESENT_RT");
+        if (!(v && v[0] == '0')) {
+            mach_timebase_info_data_t base;
+            mach_timebase_info(&base);
+            auto ticks = [&](uint64_t ns) {return (uint32_t)(ns * base.denom / base.numer);};
+            thread_time_constraint_policy_data_t policy = {ticks(16666667), ticks(1500000), ticks(5000000), 1};
+            const kern_return_t kr = thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&policy,
+                                                       THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+            gpu.mark(kr == KERN_SUCCESS ? 0x67e0 : 0x67e1);
+        }
+    }
     ScanoutContext context;
     context.marker = &gpu;
     Gpu &link = context.link;
