@@ -2660,8 +2660,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    (unsigned long long)r.height,r.pixelFormat);
   // Diagnostics that cost the render server real CPU or GPU time: loud, so a measurement taken with one on is known for what it is (a
  // profiler left in the phone's persistent gpu-env took 66-80% of a core of backboardd through a day of gfx-suite runs, 2026-10-26).
- if(cpuprof::on())row("DIAG CPU profiler on (NGPU_CPU_PROFILE): timings are not representative");
- if(pcap::on())row("DIAG pipeline capture on (NGPU_CAPTURE): timings are not representative");
+ if(cpuprof::on())row("%s","DIAG CPU profiler on (NGPU_CPU_PROFILE): timings are not representative");
+ if(pcap::on())row("%s","DIAG pipeline capture on (NGPU_CAPTURE): timings are not representative");
  row("PF problems %llu queues-refused %llu gpu-failed %llu",(unsigned long long)gProblems.load(),(unsigned long long)gQueueRefusals.load(),
    (unsigned long long)gGpuFailures.load());
   row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
