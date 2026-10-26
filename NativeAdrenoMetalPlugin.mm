@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <initializer_list>
 #include <pwd.h>
+#include <sys/stat.h>
 #include <mach/mach.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
@@ -309,6 +310,13 @@ static id deviceForPort(unsigned port) {
         if (const passwd *user = getpwuid(getuid()); user && user->pw_dir) {
             static char mesaLog[512];
             snprintf(mesaLog, sizeof mesaLog, "%s/Library/Caches/com.apple.backboardd/mesa.log", user->pw_dir);
+            // Mesa opens the file with "w": keep the last render server's log (why its device was lost) beside it as mesa.log.prev.
+            if (!getenv("MESA_LOG_FILE")) {
+                char previous[sizeof mesaLog + 8];
+                snprintf(previous, sizeof previous, "%s.prev", mesaLog);
+                struct stat st = {};
+                if (stat(mesaLog, &st) == 0 && st.st_size > 0) rename(mesaLog, previous);
+            }
             setenv("MESA_LOG_FILE", mesaLog, 0);
         }
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums.

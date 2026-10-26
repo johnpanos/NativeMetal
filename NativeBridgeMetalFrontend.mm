@@ -79,6 +79,8 @@ static void noteProblem(NSString *what) {
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
 static std::atomic<uint64_t> gSurfaceShared{0};
+// Command queues refused and command buffers that failed after submission (lost device, GPU error): native_bridge_metal_failures.
+static std::atomic<uint64_t> gQueueRefusals{0},gGpuFailures{0};
 static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
 // The last refused surface texture: the check that refused it (1 plane, 2 base, 3 plane range, 4 import, 5 texture), the surface's format,
 // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
@@ -1619,7 +1621,13 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  flushSurfaces(_surfaces);
- if(self.failedLocally || nmb_command_buffer_status(_handle)==(uint64_t)MTLCommandBufferStatusError)staleHeld(_resourceOwners);
+ const bool failedOnGpu=!self.failedLocally && nmb_command_buffer_status(_handle)==(uint64_t)MTLCommandBufferStatusError;
+ if(self.failedLocally || failedOnGpu)staleHeld(_resourceOwners);
+ // A command buffer the GPU side failed (a lost device fails every later one) is a problem row: the first eight with their reason, then counted.
+ if(failedOnGpu){
+  const uint64_t n=++gGpuFailures;
+  if(n<=8){char text[256]={};nmb_command_buffer_error(_handle,text,sizeof text);NBLOG(@"native-metal: command buffer failed (%llu): %s",(unsigned long long)n,text);}
+ }
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
@@ -2078,7 +2086,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBFence *fence=[NBFence new];fence.handle=handle;return (id<MTLFence>)fence;
 }
 - (id<MTLCommandQueue>)newCommandQueue {
- NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
+ NmbQueue *handle=nmb_queue_new(gDevice);
+ // Core Animation does not check this answer everywhere (AsynchronousDispatcher::renderer() dereferences a NULL context), so say why.
+ if(!handle){const uint64_t n=++gQueueRefusals;if(n<=8)NBLOG(@"native-metal: newCommandQueue refused (%llu): %@",(unsigned long long)n,lastError());return nil;}
  NBQueue *queue=[NBQueue new];queue.handle=handle;
  static std::atomic<uint32_t> queues{0};queue.traceSerial=++queues;
  return (id<MTLCommandQueue>)queue;
@@ -2648,6 +2658,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
    (unsigned long long)r.height,r.pixelFormat);
+  row("PF problems %llu queues-refused %llu gpu-failed %llu",(unsigned long long)gProblems.load(),(unsigned long long)gQueueRefusals.load(),
+   (unsigned long long)gGpuFailures.load());
   row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
   row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
  }
