@@ -12,8 +12,6 @@
 #include "GpuScanoutPresenter.h"
 #include "NativeGOPWire.h"
 
-// The latest frame's mach time in ms, for the shader primer (PrimeShaders.h, defined by the frontend).
-extern "C" volatile uint64_t nb_last_present_ms;
 // The frame trace's Q line: where the presenter's time between the offer and the swap's completion goes (mach times, any 0 = not taken).
 extern "C" __attribute__((weak)) void NBTracePresent(uint64_t sequence, uint64_t offered, uint64_t committed, uint64_t waitBegan, uint64_t waitEnded,
                                                      uint64_t returned, uint64_t completeBegan, uint64_t completeEnded) {
@@ -101,11 +99,6 @@ public:
         }
         const size_t page = (size_t)getpagesize();
         note(0x6730);   // a frame was offered
-        {
-            static mach_timebase_info_data_t base;
-            if (!base.denom) mach_timebase_info(&base);
-            nb_last_present_ms = mach_absolute_time() * base.numer / base.denom / 1000000;   // the shader primer's "the screen moves" (PrimeShaders.h)
-        }
         const uint64_t began = mach_absolute_time();
         presenter_->stamps_[0] = presenter_->stamps_[1] = presenter_->stamps_[2] = 0;
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),

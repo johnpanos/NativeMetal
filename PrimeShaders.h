@@ -7,7 +7,6 @@
 // State in the cache directory: prime-done lists finished libraries (path, size, mtime), prime-bad the functions that ended the process
 // (prime-current names the function being compiled; a start that finds it moves it to prime-bad), prime.log one line per library.
 // A library listed as finished is never read again, so a restart resumes where the previous run stopped.
-// It compiles only while the screen is still (no frame presented for 2 s), and while the screen keeps moving, one pipeline a minute.
 #pragma once
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -24,11 +23,6 @@
 #include <string>
 #include <vector>
 
-// The primer's state for the frontend's status rows ("PR ..."): [0] 0 waiting for its start, 1 running, 2 paused (the screen moves), 3 done;
-// [1] libraries, [2] finished, [3] pipelines made, [4] ms paused, [5] pipelines made while the screen kept moving (the minute rule).
-extern "C" volatile uint64_t nb_primer_state[6];
-// The mach time (ms) of the scanout presenter's latest frame (GpuScanoutClient.h): the screen is moving while it is recent.
-extern "C" volatile uint64_t nb_last_present_ms;
 namespace prime {
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
 
@@ -123,21 +117,6 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 if (!function) {++refused; continue;}
                 const MTLFunctionType type = function.functionType;
                 if (type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) continue;
-                // Only while the screen is still: frames presented in the last 2 s mean the user (or a test) is watching it move, and a
-                // compile then takes a core from the render server and the app (the primer took one or more cores for the first 15+
-                // minutes after a boot, fajita gfx suite). Paused at most a minute at a time: someone who keeps the screen busy still gets
-                // one pipeline a minute, at background QoS, so the pass ends.
-                {
-                    const uint64_t pausedFrom = nowMs();
-                    while (nowMs() - nb_last_present_ms < 2000 && nowMs() - pausedFrom < 60000) {
-                        nb_primer_state[0] = 2;
-                        usleep(250000);
-                    }
-                    const uint64_t paused = nowMs() - pausedFrom;
-                    nb_primer_state[4] = nb_primer_state[4] + paused;
-                    if (paused >= 60000) nb_primer_state[5] = nb_primer_state[5] + 1;
-                    nb_primer_state[0] = 1;
-                }
                 writeCurrent(current, key);
                 bool ok = false;
                 @try {
@@ -158,7 +137,6 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     ok = false;
                 }
                 ok ? ++made : ++refused;
-                if (ok) nb_primer_state[3] = nb_primer_state[3] + 1;
                 // Low priority already; a short pause between pipelines keeps the render server's own work ahead.
                 usleep(20000);
             }
@@ -188,10 +166,8 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     std::string note;
     const std::vector<std::string> paths = libraries(listPath, note);
     appendLine(logPath, note);
-    nb_primer_state[0] = 1; nb_primer_state[1] = paths.size();
     for (const std::string &path : paths) {
         ++libs;
-        nb_primer_state[2] = finished;
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;
         const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec);
@@ -201,7 +177,6 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         done.insert(id);
         ++finished;
     }
-    nb_primer_state[2] = finished; nb_primer_state[0] = 3;
     char line[120];
     snprintf(line, sizeof line, "pass libraries=%u finished=%u ms=%llu", libs, finished, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
