@@ -2128,6 +2128,7 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
   NmbBuffer *owned=nmb_buffer_new(gDevice,length,options&~MTLResourceStorageModeMask,pointer);
   if(!owned){NBLOG(@"native-metal: host copy refused: %@",lastError());return nil;}
   gNoCopyAll++;gHostCopies++;gHostCopyBytes+=length;gLiveCopies++;
+  probeHostCopy(pointer,length);
   NBBuffer *buffer=[NBBuffer new];buffer.handle=owned;buffer.options=options;
   buffer.copySource=pointer;buffer.copyBytes=length;buffer.copyDeallocator=deallocator;
   {std::lock_guard<std::mutex> lock(gImportLock);if(!gImports)gImports=[NSHashTable weakObjectsHashTable];[gImports addObject:buffer];}
@@ -2156,6 +2157,47 @@ static const bool copyMode=[]{const char *v=getenv("NGPU_HOST_COPY");return !(v 
   (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.textureType,(unsigned long)d.usage,(unsigned long)d.storageMode,
   (unsigned long)d.sampleCount,lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+}
+// Surface and host-copy probes (telemetry rows SI and HC): the last surface imports of at least 256 KiB (ID, format, size, planes), the seed
+// when imported and now, and the purgeable state; and the last host copies of at least 256 KiB. With NGPU_SURFACE_PROBE=1 (the plugin's
+// gpu-env) also the share of non-zero words in the CPU view (per mille, 64 rows sampled; "nz-" without it), when imported and at each
+// telemetry read: tells a surface its producer never filled (zero in every view) from one the GPU reads wrong (non-zero here, black on
+// screen). Safari's black page: WebKit's RGB10 tiles were zero because CoreGraphics draws them through Metal, and the drawing process had
+// no device (NOTES-wifi.md section 9 in the fajita board).
+static uint32_t cpuNonZero(const uint8_t *base,size_t row,size_t height,size_t width) {
+ static const bool on=[]{const char *v=getenv("NGPU_SURFACE_PROBE");return v && v[0]=='1';}();
+ if(!on)return 1001;   // not counted
+ if(!base || !row || !height)return 0;
+ const size_t words=(width?std::min(width,row):row)/4,step=height>64?height/64:1;uint64_t nz=0,all=0;
+ for(size_t y=0;y<height;y+=step){const uint32_t *p=(const uint32_t *)(base+y*row);for(size_t x=0;x<words;x++){nz+=p[x]!=0;all++;}}
+ return all?(uint32_t)(nz*1000/all):0;
+}
+struct SurfaceProbe {uint32_t id,format,width,height,planes,nz0,seed0,serial;uint64_t alloc;IOSurfaceRef surface;size_t row,bytesWide;};
+static SurfaceProbe gProbes[6];static NSPointerArray *gProbeTextures;static uint32_t gProbeSerial;static std::mutex gProbeLock;
+static void probeSurface(NBTexture *texture,IOSurfaceRef surface) {
+ const size_t alloc=IOSurfaceGetAllocSize(surface);if(alloc<(256u<<10))return;
+ const size_t planes=IOSurfaceGetPlaneCount(surface);
+ const size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,0):IOSurfaceGetBytesPerRow(surface);
+ const size_t height=planes?IOSurfaceGetHeightOfPlane(surface,0):IOSurfaceGetHeight(surface);
+ const size_t wide=(planes?IOSurfaceGetWidthOfPlane(surface,0)*IOSurfaceGetBytesPerElementOfPlane(surface,0):IOSurfaceGetWidth(surface)*IOSurfaceGetBytesPerElement(surface));
+ const uint8_t *base=(const uint8_t *)(planes?IOSurfaceGetBaseAddressOfPlane(surface,0):IOSurfaceGetBaseAddress(surface));
+ SurfaceProbe r={IOSurfaceGetID(surface),IOSurfaceGetPixelFormat(surface),(uint32_t)IOSurfaceGetWidth(surface),(uint32_t)IOSurfaceGetHeight(surface),
+                 (uint32_t)planes,cpuNonZero(base,row,height,wide),IOSurfaceGetSeed(surface),0,alloc,surface,row,wide};
+ std::lock_guard<std::mutex> lock(gProbeLock);
+ if(!gProbeTextures){gProbeTextures=[NSPointerArray weakObjectsPointerArray];gProbeTextures.count=6;}
+ const unsigned slot=gProbeSerial%6;r.serial=++gProbeSerial;gProbes[slot]=r;[gProbeTextures replacePointerAtIndex:slot withPointer:(__bridge void *)texture];
+}
+struct HostCopyProbe {uint64_t length;uint32_t nz,serial;};
+static HostCopyProbe gHostCopyProbes[3];static uint32_t gHostCopySerial;
+static void probeHostCopy(const void *pointer,size_t length) {
+ if(length<(256u<<10))return;
+ const uint32_t nz=cpuNonZero((const uint8_t *)pointer,4096,length/4096,4096);
+ std::lock_guard<std::mutex> lock(gProbeLock);
+ gHostCopyProbes[gHostCopySerial%3]={length,nz,gHostCopySerial+1};gHostCopySerial++;
+}
+static const char *purgeableName(IOSurfaceRef surface) {
+ uint32_t old=99;if(IOSurfaceSetPurgeable(surface,kIOSurfacePurgeableKeepCurrent,&old))return "?";
+ return old==kIOSurfacePurgeableNonVolatile?"nv":old==kIOSurfacePurgeableVolatile?"VOL":old==kIOSurfacePurgeableEmpty?"EMPTY":"?";
 }
 // One texture per surface plane and descriptor (NGPU_SURFACE_SHARE=0 makes every call import its own): a later texture over the same
 // surface plane with the same descriptor is a view of the first live one, so the two share its shadow image. CoreAnimation wraps
@@ -2195,6 +2237,7 @@ static NSString *surfaceTextureKey(IOSurfaceRef surface,NSUInteger plane,MTLText
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);
+ probeSurface(texture,surface);
  if(share){@synchronized(gSurfaceTexturesBySurface){[gSurfaceTexturesBySurface setObject:texture forKey:key];}}
  return (id<MTLTexture>)texture;
 }
@@ -2568,6 +2611,25 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("N surface generations stated %llu",(unsigned long long)gSurfaceGenerations.load());
  row("N host copies %llu bytes %llu",(unsigned long long)gHostCopies.load(),(unsigned long long)gHostCopyBytes.load());
  row("N host remaps %llu ranges %llu",(unsigned long long)gHostRemaps.load(),(unsigned long long)[]{std::lock_guard<std::mutex> l(gHostRangeLock);return gHostRanges.size();}());
+ {
+  std::lock_guard<std::mutex> lock(gProbeLock);
+  for(unsigned k=0;k<6 && k<gProbeSerial;k++) {
+   const unsigned slot=(gProbeSerial-1-k)%6;const SurfaceProbe &p=gProbes[slot];
+   NBTexture *alive=gProbeTextures?(__bridge NBTexture *)[gProbeTextures pointerAtIndex:slot]:nil;
+   const char f[5]={char(p.format>>24),char(p.format>>16),char(p.format>>8),char(p.format),0};
+   if(alive) {
+    const IOSurfaceRef s=p.surface;const bool planar=p.planes!=0;
+    const uint8_t *base=(const uint8_t *)(planar?IOSurfaceGetBaseAddressOfPlane(s,0):IOSurfaceGetBaseAddress(s));
+    const size_t height=planar?IOSurfaceGetHeightOfPlane(s,0):IOSurfaceGetHeight(s);
+    char nz[24];const uint32_t now=cpuNonZero(base,p.row,height,p.bytesWide);
+    if(now>1000)strlcpy(nz,"-",sizeof nz);else snprintf(nz,sizeof nz,"%u/%u",p.nz0,now);
+    row("SI%u id%u %s %ux%u pl%u %lluk nz%s seed%u/%u %s",p.serial,p.id,f,p.width,p.height,p.planes,(unsigned long long)(p.alloc>>10),nz,
+     p.seed0,IOSurfaceGetSeed(s),purgeableName(s));
+   } else row("SI%u id%u %s %ux%u pl%u %lluk seed%u gone",p.serial,p.id,f,p.width,p.height,p.planes,(unsigned long long)(p.alloc>>10),p.seed0);
+  }
+  for(unsigned k=0;k<3 && k<gHostCopySerial;k++){const HostCopyProbe &h=gHostCopyProbes[(gHostCopySerial-1-k)%3];
+   if(h.nz>1000)row("HC%u %lluk",h.serial,(unsigned long long)(h.length>>10));else row("HC%u %lluk nz%u",h.serial,(unsigned long long)(h.length>>10),h.nz);}
+ }
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
