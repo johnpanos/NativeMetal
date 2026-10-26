@@ -733,6 +733,7 @@ static void notified(void *context,uint64_t value) {
  // The frame trace (FrameTrace.h), when it is on: the commit's return, and the frontend's totals when the command buffer was made.
  uint64_t traceCommittedUs,tracePipeUs,tracePipeN,traceWaitUs,traceFlushUs,traceFlushBytes,traceDoneUs,traceHandledUs;
  std::atomic<int> traceJoin;   // the commit's return and the completion: the second writes the C line
+ std::atomic<bool> finished;   // finish ran (the GPU completed it, or it was refused): status and error are final
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -1461,12 +1462,15 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
  if(!self.encodeFailure){self.encodeFailure=what;NBLOG(@"native-metal: command buffer refused: %@",what);}
 }
 - (MTLCommandBufferStatus)status {
- encodeDrain();
+ // A finished command buffer's status is final: draining the encode worker (serial, behind every process thread's encoding) only made
+ // the caller wait out other work, e.g. the scanout presenter after its copy completed waited 1.45 ms (median; p90 5 ms) for the
+ // render server's next frame being translated, between the copy's completion and the swap's (gfx suite, home, frame trace Q lines).
+ if(!finished.load(std::memory_order_acquire))encodeDrain();
  if(self.failedLocally)return MTLCommandBufferStatusError;
  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
 }
 - (NSError *)error {
- encodeDrain();
+ if(!finished.load(std::memory_order_acquire))encodeDrain();
  if(self.failedLocally)return nbError(self.encodeFailure);
  if(self.status!=MTLCommandBufferStatusError)return nil;
  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);
@@ -1621,6 +1625,7 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
+ finished.store(true,std::memory_order_release);
  flushSurfaces(_surfaces);
  const bool failedOnGpu=!self.failedLocally && nmb_command_buffer_status(_handle)==(uint64_t)MTLCommandBufferStatusError;
  if(self.failedLocally || failedOnGpu)staleHeld(_resourceOwners);
@@ -1693,7 +1698,7 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
 }
 - (void)waitUntilCompleted {
  if(!self.committed)return;
- encodeDrain();
+ if(!finished.load(std::memory_order_acquire))encodeDrain();
  const uint64_t began=nowUs();
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
