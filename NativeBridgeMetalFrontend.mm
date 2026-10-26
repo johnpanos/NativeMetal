@@ -23,6 +23,7 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <mach/mach_time.h>
 #include <mach/mach.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
