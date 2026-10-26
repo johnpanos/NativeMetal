@@ -37,6 +37,14 @@
 namespace publish {
 // The image's marker: a file beside the bundle in the union view of /System/Library/Extensions (the bundle's own seal stays untouched).
 // A file beside the bundle: its path in path, true when it is readable.
+// mkdir -p: every missing component of an absolute path (0700); an existing one is fine.
+static void makePath(const char *path) {
+    char partial[512];
+    strlcpy(partial, path, sizeof partial);
+    for (char *p = partial + 1; *p; ++p)
+        if (*p == '/') {*p = 0; mkdir(partial, 0700); *p = '/';}
+    mkdir(partial, 0700);
+}
 static bool requestedPath(const char *name, char *path, size_t size) {
     Dl_info info = {};
     if (!dladdr(reinterpret_cast<const void *>(&requestedPath), &info) || !info.dli_fname) return false;
@@ -332,8 +340,10 @@ static id deviceForPort(unsigned port) {
         // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
         // (marker 0x6814); the earlier candidates keep their markers.
         if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
+            // The whole path: on a fresh Data store Library/Caches/com.apple.backboardd does not exist yet, and a single mkdir of the leaf
+            // failed, so every boot fell back to a temp directory (no m2v cache under Library/Caches at all).
             snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple.backboardd", user->pw_dir);
-            mkdir(candidates[4], 0700);
+            makePath(candidates[4]);
             strlcat(candidates[4], "/", sizeof candidates[4]);
         }
         static const unsigned order[] = {4, 0, 1, 2, 3};
@@ -343,8 +353,16 @@ static id deviceForPort(unsigned port) {
             // NGPU_M2V_DIR (gpu-env): another directory name, e.g. a fresh one so every pipeline compiles again (shader dumps).
             const char *m2v = getenv("NGPU_M2V_DIR");
             strlcat(candidates[i], m2v && m2v[0] && !strchr(m2v, '/') ? m2v : "m2v", sizeof candidates[i]);
-            mkdir(candidates[i], 0700);
-            if (access(candidates[i], W_OK) != 0) continue;
+            makePath(candidates[i]);
+            if (access(candidates[i], W_OK) != 0) {
+                // Loud: which cache directory was refused and why (the next candidate is a temp directory that boots may empty).
+                const int why = errno;
+                fprintf(stderr, "NativeAdrenoMetal: cache directory %s refused: %s\n", candidates[i], strerror(why));
+                char text[64];
+                snprintf(text, sizeof text, "PUB cachedir%u errno %d", i, why);
+                streamText(*gpu, text);
+                continue;
+            }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.
             if (char pack[1024]; requestedPath("NativeAdrenoMetal.m2vpack", pack, sizeof pack)) {
@@ -356,7 +374,13 @@ static id deviceForPort(unsigned port) {
             } @catch (NSException *exception) {
                 device = nil;
             }
-            if (device) {gpu->mark(0x6810 + i); gCacheDirectory = candidates[i];}   // which directory served
+            if (device) {
+                gpu->mark(0x6810 + i); gCacheDirectory = candidates[i];   // which directory served
+                fprintf(stderr, "NativeAdrenoMetal: %s: cache directory %s (candidate %u)\n", getprogname(), candidates[i], i);
+                if (i != 4) {char text[64]; snprintf(text, sizeof text, "PUB cachedir fallback %u", i); streamText(*gpu, text);}
+            } else {
+                fprintf(stderr, "NativeAdrenoMetal: %s: no device from %s: %s\n", getprogname(), candidates[i], nmb_last_error());
+            }
         }
         if (!device) {
             gpu->mark(0x68f2);
