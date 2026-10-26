@@ -115,6 +115,8 @@ public:
         return finish(commands, frame);
     }
     uint64_t importsKept() const { return kept_; }
+    // Mach times of the last frame's copy: [0] committed, [1] its wait began, [2] the wait returned (the frame trace's Q line).
+    uint64_t stamps_[3] = {};
     uint64_t pipelined() const { return pipelined_; }
     uint64_t importsMade() const { return made_; }
 private:
@@ -142,7 +144,9 @@ private:
             if (previous.status != MTLCommandBufferStatusCompleted) {[commands waitUntilCompleted]; return kGpuFailed;}
         }
         if (frame.mapId && !frame.flip && pipelineAllowed()) {pending_ = commands; ++pipelined_; return kOk;}
+        stamps_[1] = mach_absolute_time();
         [commands waitUntilCompleted];
+        stamps_[2] = mach_absolute_time();
         const bool ok = commands.status == MTLCommandBufferStatusCompleted;
         if (frame.flip) done_ = commands;
         return ok ? kOk : kGpuFailed;
@@ -264,6 +268,7 @@ private:
         [compute dispatchThreadgroups:MTLSizeMake((cols + 15) / 16, (p.oh + 7) / 8, 1) threadsPerThreadgroup:group];
         [compute endEncoding];
         [commands commit];
+        stamps_[0] = mach_absolute_time();
         const Result r = finish(commands, frame);
         if (r != kOk) return r;
         letterboxed_ = true;

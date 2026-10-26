@@ -2683,6 +2683,16 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
  return native_bridge_metal_formats_locked(out,size);
 }
 
+// The presenter's stages per swap (GpuScanoutClient.h declares it weak): Q,seq,offered,committed,waitBegan,waitEnded,returned,completeBegan,
+// completeEnded, us of the mach clock (0: not taken).
+extern "C" void NBTracePresent(uint64_t sequence,uint64_t offered,uint64_t committed,uint64_t waitBegan,uint64_t waitEnded,uint64_t returned,
+                               uint64_t completeBegan,uint64_t completeEnded) {
+ if(!ftrace::on())return;
+ static mach_timebase_info_data_t base;if(!base.denom)mach_timebase_info(&base);
+ auto us=[](uint64_t t)->unsigned long long {return t?(unsigned long long)(t*base.numer/base.denom/1000):0;};
+ ftrace::linef("Q,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",(unsigned long long)sequence,us(offered),us(committed),us(waitBegan),us(waitEnded),us(returned),
+               us(completeBegan),us(completeEnded));
+}
 // The scanout client's swaps for the frame trace (GpuScanoutClient.h declares it weak).
 extern "C" void NBTraceSwap(uint64_t sequence,uint64_t waitUs,uint64_t offerUs,uint64_t presentedUs,uint64_t completedUs,uint32_t width,uint32_t height,
                             uint32_t mapId,int result) {

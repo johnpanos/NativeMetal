@@ -12,6 +12,11 @@
 #include "GpuScanoutPresenter.h"
 #include "NativeGOPWire.h"
 
+// The frame trace's Q line: where the presenter's time between the offer and the swap's completion goes (mach times, any 0 = not taken).
+extern "C" __attribute__((weak)) void NBTracePresent(uint64_t sequence, uint64_t offered, uint64_t committed, uint64_t waitBegan, uint64_t waitEnded,
+                                                     uint64_t returned, uint64_t completeBegan, uint64_t completeEnded) {
+    (void)sequence; (void)offered; (void)committed; (void)waitBegan; (void)waitEnded; (void)returned; (void)completeBegan; (void)completeEnded;
+}
 // The native frontend's frame trace (FrameTrace.h): one S line per swap. A no-op elsewhere; the frontend's definition replaces this one.
 extern "C" __attribute__((weak)) void NBTraceSwap(uint64_t sequence, uint64_t waitUs, uint64_t offerUs, uint64_t presentedUs, uint64_t completedUs,
                                                   uint32_t width, uint32_t height, uint32_t mapId, int result) {
@@ -95,9 +100,11 @@ public:
         const size_t page = (size_t)getpagesize();
         note(0x6730);   // a frame was offered
         const uint64_t began = mach_absolute_time();
+        presenter_->stamps_[0] = presenter_->stamps_[1] = presenter_->stamps_[2] = 0;
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
                                                           (size_t)swap.stride, swap.width, swap.height, swap.reserved, swap.target,
                                                           (swap.flags & 1u) != 0});
+        const uint64_t returned = mach_absolute_time();
         {
             static mach_timebase_info_data_t base;
             if (!base.denom) mach_timebase_info(&base);
@@ -119,6 +126,8 @@ public:
             NBTraceSwap(swap.sequence, us(waitBegan), us(began), us(presented), us(mach_absolute_time()), swap.width, swap.height, swap.reserved,
                         completed ? -1 : (int)r);
         }
+        NBTracePresent(swap.sequence, began, presenter_->stamps_[0], presenter_->stamps_[1], presenter_->stamps_[2], returned, presented,
+                       mach_absolute_time());
         if (completed) {++stats_->failures; stats_->error = completed; return false;}
         if (r == gpupresent::kOk) ++stats_->frames; else ++stats_->failures;
         return true;
