@@ -24,6 +24,8 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <mach/mach_time.h>
+// The shader primer's state and the latest scanout frame's time (PrimeShaders.h, GpuScanoutClient.h).
+extern "C" {volatile uint64_t nb_primer_state[6];volatile uint64_t nb_last_present_ms;}
 #include <mach/mach.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
@@ -2664,7 +2666,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
    (unsigned long long)r.height,r.pixelFormat);
-  row("PF problems %llu queues-refused %llu gpu-failed %llu",(unsigned long long)gProblems.load(),(unsigned long long)gQueueRefusals.load(),
+  {static const char *const states[]={"waiting","running","paused","done"};const uint64_t st=nb_primer_state[0];
+  row("PR primer %s libraries %llu/%llu pipelines %llu paused %llus forced %llu",st<4?states[st]:"?",(unsigned long long)nb_primer_state[2],
+      (unsigned long long)nb_primer_state[1],(unsigned long long)nb_primer_state[3],(unsigned long long)(nb_primer_state[4]/1000),
+      (unsigned long long)nb_primer_state[5]);}
+ row("PF problems %llu queues-refused %llu gpu-failed %llu",(unsigned long long)gProblems.load(),(unsigned long long)gQueueRefusals.load(),
    (unsigned long long)gGpuFailures.load());
   row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
   row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
