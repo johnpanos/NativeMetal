@@ -1486,7 +1486,10 @@ static void traceTotals(uint64_t &pipeUs,uint64_t &pipeN,uint64_t &waitUs,uint64
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
  if(!asyncEncode()) {
   NmbEncoder *handle=make();
-  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
+  /* A refused encoder is still an object: its calls fail on the null handle and the buffer completes with an error (upstream ce5e19e).
+   * RenderBox caches the encoder's IMPs with methodForSelector:, and on nil it called address 0 (upstream i568: WidgetRenderer crashed
+   * eight launches running, then hit its open cap). */
+  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];encoder.commandBuffer=self;return encoder;}
   encoder.handle=handle;
  } else {
   // On the worker: a refusal there fails the command buffer, and the encoder's calls meet a null handle, which the bridge refuses.
