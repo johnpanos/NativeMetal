@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index ab5c6fb..2cd5f2f 100644
+index 228e091..47001cd 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
 @@ -7822,6 +7822,11 @@ impl Recording<'_> {
